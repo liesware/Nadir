@@ -40,6 +40,8 @@ pub enum RunStopReason {
     BaselineIncomplete,
     /// A process exit finding stopped the run.
     ProcessExit,
+    /// The user stopped the run from the `debug` display.
+    StoppedByUser,
 }
 
 impl RunBudget {
@@ -127,3 +129,42 @@ impl RunBudget {
         self.start.elapsed()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_reason_prevents_next_case() {
+        let mut budget = RunBudget::new(10, None, None);
+        assert!(budget.can_start_case());
+        budget.stop(RunStopReason::ProcessExit);
+        assert!(!budget.can_start_case());
+    }
+
+    #[test]
+    fn stopped_by_user_prevents_next_case() {
+        let mut budget = RunBudget::new(10, None, None);
+        assert!(budget.can_start_case());
+        budget.stop(RunStopReason::StoppedByUser);
+        assert!(!budget.can_start_case());
+    }
+
+    #[test]
+    fn deadline_expired_prevents_next_case() {
+        let budget = RunBudget::new(10, None, Some(Duration::ZERO));
+        // The deadline is in the past, so can_start_case returns false.
+        assert!(!budget.can_start_case());
+    }
+
+    #[test]
+    fn max_cases_exhausted_alone_does_not_set_stop_reason() {
+        let mut budget = RunBudget::new(1, None, None);
+        assert!(budget.can_start_case());
+        budget.record_case();
+        // max_cases reached but no explicit stop reason
+        assert!(!budget.can_start_case());
+        assert!(budget.stop_reason.is_none());
+    }
+}
+

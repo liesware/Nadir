@@ -19,3 +19,7 @@ __pycache__/
 *~
 .DS_Store
 internal/
+cases/
+# Crash records written next to each experiment YAML
+**/artifacts/crashes/
+**/artifacts/transport-errors/

@@ -103,6 +103,7 @@ mod tests {
                 input_kind: InputKind::JsonField,
                 representation: ValueRepresentation::JsonString,
                 mutation_mode: None,
+                mutator_index: None,
             },
             PartDescriptor {
                 step_id: "s2".into(),
@@ -110,6 +111,7 @@ mod tests {
                 input_kind: InputKind::HeaderField,
                 representation: ValueRepresentation::HeaderAscii,
                 mutation_mode: None,
+                mutator_index: None,
             },
         ];
 
@@ -143,6 +145,7 @@ mod tests {
             input_kind: InputKind::JsonField,
             representation: ValueRepresentation::JsonString,
             mutation_mode: None,
+            mutator_index: None,
         }];
 
         let parts = vec![("body.x".into(), Vec::new())];

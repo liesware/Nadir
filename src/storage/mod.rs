@@ -7,6 +7,7 @@
 //! `findings/<NNNN>.json`, and the corpus uses SHA-256 filenames.
 
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -14,7 +15,8 @@ use crate::artifacts::{FuzzCaseRef, FuzzRecord,
     regression_record, CaseRecord, CorpusEntryRecord, FindingRecord, RegressionPlan, RunRecord,
 };
 use crate::config::ResolvedExperiment;
-use crate::evaluation::case::ExecutedPlan;
+use crate::evaluation::case::{EvaluatedCase, ExecutedPlan};
+use crate::execution::diagnostic::{ExecutionDiagnostic, ExecutionOutcome};
 use crate::exploration::EnumerationResult;
 use crate::finding::{DedupMap, GroupingKey};
 
@@ -36,6 +38,11 @@ pub enum StorageError {
     },
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("serializing {path}: {source}")]
+    SerializeYaml {
+        path: PathBuf,
+        source: serde_yaml::Error,
+    },
 }
 
 /// Generates a run ID in the format `YYYYMMDDTHHMMSSZ-XXXXXX`.
@@ -135,6 +142,7 @@ impl RunDirectory {
         configuration: &ResolvedExperiment,
         result: &EnumerationResult,
         diagnostic_secrets: &[String],
+        transport_errors: u64,
     ) -> Result<WrittenRun, StorageError> {
         let mut record = RunRecord::new(
             configuration.experiment.name.clone(),
@@ -157,49 +165,13 @@ impl RunDirectory {
         });
         record.findings = finding_records(&result.findings);
         record.counters.findings_count = result.findings.len() as u32;
+        record.counters.transport_errors = transport_errors;
         let mut case_paths = Vec::new();
         for (index, evaluated) in std::iter::once(&result.baseline_case)
             .chain(&result.cases)
             .enumerate()
         {
-            let mut case = regression_record(
-                &configuration.experiment,
-                evaluated,
-                index as u32,
-                diagnostic_secrets,
-            );
-            let replay_fields = match &evaluated.plan {
-                ExecutedPlan::Baseline => Some((None, None, None, None)),
-                ExecutedPlan::Variant { replay, .. } => {
-                    replay.clone().map(|variant| (Some(variant), None, None, None))
-                }
-                ExecutedPlan::Example {
-                    example_id,
-                    step_id,
-                    ..
-                } => Some((None, Some(example_id.clone()), Some(step_id.clone()), None)),
-                ExecutedPlan::Fuzz {
-                    seed, iteration, ..
-                } => Some((
-                    None,
-                    None,
-                    None,
-                    Some(FuzzCaseRef {
-                        seed: *seed,
-                        iteration: *iteration,
-                    }),
-                )),
-            };
-            if let Some((variant, example_id, example_step_id, fuzz)) = replay_fields {
-                case.regression_plan = Some(RegressionPlan {
-                    experiment_sha256: configuration.sha256.clone(),
-                    openapi_fingerprints: configuration.openapi_fingerprints.clone(),
-                    variant,
-                    example_id,
-                    example_step_id,
-                    fuzz,
-                });
-            }
+            let case = case_record(configuration, evaluated, index as u32, diagnostic_secrets);
             case_paths.push(write_case_record(&self.path, &case)?);
             record.counters.cases_executed += 1;
             record.counters.requests_sent += evaluated.execution.requests_sent;
@@ -278,6 +250,132 @@ fn finding_records(findings: &DedupMap) -> Vec<FindingRecord> {
     records
 }
 
+/// The record of one executed case, with the plan `replay` needs.
+pub(crate) fn case_record(
+    configuration: &ResolvedExperiment,
+    evaluated: &EvaluatedCase,
+    number: u32,
+    diagnostic_secrets: &[String],
+) -> CaseRecord {
+    let mut case = regression_record(&configuration.experiment, evaluated, number, diagnostic_secrets);
+    let mut plan = RegressionPlan {
+        experiment_sha256: configuration.sha256.clone(),
+        openapi_fingerprints: configuration.openapi_fingerprints.clone(),
+        variant: None,
+        example_id: None,
+        example_step_id: None,
+        fuzz: None,
+        corpus: None,
+        json_example: None,
+        malform: None,
+    };
+    match &evaluated.plan {
+        ExecutedPlan::Baseline => {}
+        ExecutedPlan::Variant { replay, .. } => plan.variant = replay.clone(),
+        ExecutedPlan::Example { example_id, step_id, json_example, .. } => {
+            plan.example_id = Some(example_id.clone());
+            plan.example_step_id = Some(step_id.clone());
+            plan.json_example = json_example.clone();
+        }
+        ExecutedPlan::Fuzz { seed, iteration, generator, max_fields, .. } => {
+            plan.fuzz = Some(FuzzCaseRef {
+                seed: *seed,
+                iteration: *iteration,
+                generator: *generator,
+                max_fields: *max_fields,
+            });
+        }
+        ExecutedPlan::Corpus(reference) => plan.corpus = Some(reference.clone()),
+        ExecutedPlan::Malform { step_id, malformation } => {
+            plan.malform = Some(crate::artifacts::MalformRef {
+                step_id: step_id.clone(),
+                name: malformation.name().into(),
+            });
+        }
+    }
+    if !matches!(&evaluated.plan, ExecutedPlan::Variant { replay: None, .. }) {
+        case.regression_plan = Some(plan);
+    }
+    case
+}
+
+/// Folder for crash records, next to the experiment file.
+pub const CRASHES_DIR: &str = "artifacts/crashes";
+pub const TRANSPORT_ERRORS_DIR: &str = "artifacts/transport-errors";
+
+#[derive(serde::Serialize)]
+struct DiagnosticArtifact<'a> {
+    artifact_version: u32,
+    case_id: &'a str,
+    case_record: &'a str,
+    #[serde(flatten)]
+    diagnostic: &'a ExecutionDiagnostic<'a>,
+}
+
+pub(crate) fn write_crash_record(
+    experiment_directory: &Path,
+    record: &CaseRecord,
+) -> Result<PathBuf, StorageError> {
+    write_case_artifact(&experiment_directory.join(CRASHES_DIR), record, None)
+}
+
+pub(crate) fn write_execution_diagnostic(
+    experiment_directory: &Path,
+    record: &CaseRecord,
+    diagnostic: &ExecutionDiagnostic<'_>,
+) -> Result<PathBuf, StorageError> {
+    let mut evidence = record.clone();
+    evidence.regression_plan = None;
+    let folder = match diagnostic.outcome {
+        ExecutionOutcome::ProcessExit { .. } => CRASHES_DIR,
+        ExecutionOutcome::TransportError { .. } => TRANSPORT_ERRORS_DIR,
+    };
+    write_case_artifact(&experiment_directory.join(folder), &evidence, Some(diagnostic))
+}
+
+fn write_case_artifact(
+    directory: &Path,
+    record: &CaseRecord,
+    diagnostic: Option<&ExecutionDiagnostic<'_>>,
+) -> Result<PathBuf, StorageError> {
+    fs::create_dir_all(directory).map_err(|source| path_error("creating", directory, source))?;
+    let json = serde_json::to_vec_pretty(record)?;
+    loop {
+        let name = crash_file_name();
+        let json_path = directory.join(&name);
+        let yaml_path = json_path.with_extension("yaml");
+        if yaml_path.try_exists().map_err(|source| path_error("checking", &yaml_path, source))? {
+            continue;
+        }
+        match publish_file(&json_path, &json, |temporary| fs::hard_link(temporary, &json_path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(path_error("publishing", &json_path, source)),
+        }
+        let Some(diagnostic) = diagnostic else {
+            return Ok(json_path);
+        };
+        let artifact = DiagnosticArtifact {
+            artifact_version: 1,
+            case_id: &record.case_id,
+            case_record: &name,
+            diagnostic,
+        };
+        let yaml = serde_yaml::to_string(&artifact)
+            .map_err(|source| StorageError::SerializeYaml { path: yaml_path.clone(), source })?;
+        publish_file(&yaml_path, yaml.as_bytes(), |temporary| fs::hard_link(temporary, &yaml_path))
+            .map_err(|source| path_error("publishing", &yaml_path, source))?;
+        return Ok(yaml_path);
+    }
+}
+
+/// `27-11-2026-184512-a3f9c1.json`: local time, then six random hex digits.
+fn crash_file_name() -> String {
+    let suffix = (uuid::Uuid::new_v4().as_u128() & 0xff_ffff) as u32;
+    let now = jiff::ZonedDateTime::now();
+    format!("{}-{suffix:06x}.json", now.strftime("%d-%m-%Y-%H%M%S"))
+}
+
 fn path_error(action: &'static str, path: &Path, source: std::io::Error) -> StorageError {
     StorageError::Path {
         action,
@@ -299,13 +397,22 @@ fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<(), StorageE
         path: path.to_owned(),
         source,
     })?;
-    let temporary = path.with_extension("json.tmp");
-    let result = fs::write(&temporary, json).and_then(|()| fs::rename(&temporary, path));
-    if let Err(source) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(path_error("writing", path, source));
-    }
-    Ok(())
+    publish_file(path, &json, |temporary| fs::rename(temporary, path))
+        .map_err(|source| path_error("writing", path, source))
+}
+
+fn publish_file(
+    path: &Path,
+    bytes: &[u8],
+    publish: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| publish(&temporary));
+    let _ = fs::remove_file(&temporary);
+    result
 }
 
 /// Write a finding record to `findings/<NNNN>.json`.
@@ -355,7 +462,7 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("nadir_storage_{}", std::process::id()))
+        std::env::temp_dir().join(format!("nadir_storage_{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -385,6 +492,7 @@ mod tests {
             step_results: vec![],
             coverage_snapshot_sha256: None,
             regression_plan: None,
+            process_exit: None,
         };
 
         write_case_record(&dir, &record).unwrap();
@@ -406,8 +514,69 @@ mod tests {
         fs::create_dir_all(&destination).unwrap();
         let error = write_json(&destination, &serde_json::json!({"status": "passed"})).unwrap_err();
         assert!(matches!(error, StorageError::Path { path, .. } if path == destination));
-        assert!(!destination.with_extension("json.tmp").exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publish_collision_preserves_the_old_file_and_removes_the_temporary() {
+        let directory = temp_dir();
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("case.yaml");
+        fs::write(&path, b"old").unwrap();
+        let error = publish_file(&path, b"new", |temporary| {
+            assert_eq!(fs::read(&path)?, b"old");
+            assert_eq!(fs::read(temporary)?, b"new");
+            fs::hard_link(temporary, &path)
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_failed_atomic_publication_leaves_no_visible_artifact() {
+        let directory = temp_dir();
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("case.yaml");
+        let result = publish_file(&path, b"complete", |temporary| {
+            assert!(!path.exists());
+            assert_eq!(fs::read(temporary)?, b"complete");
+            Err(io::Error::other("publication interrupted"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn crash_files_are_named_by_local_time_and_never_collide() {
+        let name = crash_file_name();
+        let bytes = name.as_bytes();
+        assert_eq!(name.len(), "27-11-2026-184512-a3f9c1.json".len(), "{name}");
+        for (index, byte) in bytes.iter().enumerate() {
+            match index {
+                2 | 5 | 10 | 17 => assert_eq!(*byte, b'-', "{name}"),
+                0..=16 => assert!(byte.is_ascii_digit(), "{name}"),
+                18..=23 => assert!(byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(), "{name}"),
+                _ => {}
+            }
+        }
+        assert!(name.ends_with(".json"));
+
+        let dir = temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let record: CaseRecord = serde_json::from_value(serde_json::json!({
+            "artifact_version": 1, "case_id": "c", "case_number": 3,
+            "step_results": [], "coverage_snapshot_sha256": null,
+            "process_exit": null
+        })).unwrap();
+        let first = write_crash_record(&dir, &record).unwrap();
+        let second = write_crash_record(&dir, &record).unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with(dir.join(CRASHES_DIR)));
+        assert_eq!(load_case_record(&first).unwrap().case_number, 3);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

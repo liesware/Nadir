@@ -49,6 +49,10 @@ fn validate_exploration(exploration: &Option<RawExploration>) -> Result<(), Stri
     // Validate strategy. `fuzz` runs without a target too; with one, it also
     // detects crashes.
     match expl.strategy.as_str() {
+        // Enumeration changes one part per case.
+        "enumerate" if expl.max_fields.is_some() => {
+            return Err("exploration max_fields requires strategy: fuzz".into());
+        }
         "enumerate" => {}
         "fuzz" => {
             match expl.duration_s {
@@ -60,6 +64,9 @@ fn validate_exploration(exploration: &Option<RawExploration>) -> Result<(), Stri
             }
             if expl.max_execs == Some(0) {
                 return Err("exploration max_execs must be at least 1".into());
+            }
+            if expl.max_fields == Some(0) {
+                return Err("exploration max_fields must be at least 1".into());
             }
         }
         other => {
@@ -196,10 +203,11 @@ fn validate_steps(steps: &[RawStep]) -> Result<(), String> {
         }
     }
 
-    // Check that bound fields are not also mutated (within the same step).
-    // `json` fields compare by path segment, so `metadata` and
-    // `metadata.source` overlap but `subtitle` and `title` do not; header
-    // names compare case-insensitively.
+    // Check that bound body fields are not also mutated (within the same
+    // step). Fields compare by path segment, so `metadata` and
+    // `metadata.source` overlap but `subtitle` and `title` do not. Header and
+    // path values may be bound and mutated: the baseline sends the bound
+    // value and each mutated case replaces it.
     for step in steps {
         let (Some(cases), Some(bind_map)) = (&step.cases, &step.bind) else {
             continue;
@@ -210,15 +218,12 @@ fn validate_steps(steps: &[RawStep]) -> Result<(), String> {
             };
             for field in mutator_fields {
                 let conflict = bind_map.keys().any(|bind_key| match mutator.r#use.as_str() {
-                    "json" => bind_key.strip_prefix("body.").is_some_and(|bound| {
+                    "json" | "file" | "file_fuzz" => bind_key.strip_prefix("body.").is_some_and(|bound| {
                         paths_overlap(
                             &bound.split('.').collect::<Vec<_>>(),
                             &field.split('.').collect::<Vec<_>>(),
                         )
                     }),
-                    "headers" => bind_key
-                        .strip_prefix("header.")
-                        .is_some_and(|bound| bound.eq_ignore_ascii_case(field)),
                     _ => false,
                 });
                 if conflict {
@@ -388,23 +393,31 @@ mod tests {
                 max_execs: None,
                 duration_s: None,
                 seed: None,
+
+                max_fields: None,
             }),
             target: None,
-            adapters: RawAdapters { http: None },
+            protocols: RawProtocols { http: None },
             steps: vec![],
+            hidden: None,
         }
     }
 
     fn make_step(id: &str) -> RawStep {
         RawStep {
             id: id.into(),
-            adapter: "http".into(),
-            operation_id: "testOp".into(),
+            protocol: "http".into(),
+            format: None,
+            operation_id: Some("testOp".into()),
+            operation_path: None,
+            body_example: None,
             bind: None,
             auth: None,
             outputs: None,
             cases: None,
             oracles: vec![],
+            print: None,
+            debug: None,
         }
     }
 
@@ -452,6 +465,7 @@ mod tests {
                 fields: Some(vec![field.into()]),
                 values: Some(vec!["v".into()]),
                 mode: None,
+                ..RawMutator::default()
             }],
             examples: vec![],
         });
@@ -487,17 +501,31 @@ mod tests {
             validate_step(step_with_bind_and_mutator("body.metadata.source", "json", "metadata.id"))
                 .is_ok()
         );
-        let error = validate_step(step_with_bind_and_mutator(
+        // A bound header can be mutated: each case replaces the bound value.
+        assert!(validate_step(step_with_bind_and_mutator(
             "header.accept-language",
             "headers",
             "Accept-Language",
         ))
-        .unwrap_err();
-        assert!(error.contains("also bound"), "{error}");
-        assert!(
-            validate_step(step_with_bind_and_mutator("header.Accept", "headers", "Accept-Language"))
-                .is_ok()
-        );
+        .is_ok());
+        assert!(validate_step(step_with_bind_and_mutator("header.X-Key", "http", "header.x-key")).is_ok());
+    }
+
+    #[test]
+    fn max_fields_needs_fuzz_and_a_positive_value() {
+        let exploration = |strategy: &str, max_fields| Some(RawExploration {
+            strategy: strategy.into(),
+            max_execs: None,
+            duration_s: Some(5),
+            seed: None,
+            max_fields,
+        });
+        assert!(validate_exploration(&exploration("fuzz", Some(2))).is_ok());
+        assert!(validate_exploration(&exploration("fuzz", None)).is_ok());
+        assert_eq!(validate_exploration(&exploration("fuzz", Some(0))).unwrap_err(),
+            "exploration max_fields must be at least 1");
+        assert_eq!(validate_exploration(&exploration("enumerate", Some(1))).unwrap_err(),
+            "exploration max_fields requires strategy: fuzz");
     }
 
     #[test]
@@ -573,6 +601,7 @@ mod tests {
                 fields: Some(vec!["title".into()]),
                 values: None,
                 mode: Some("schema_valid".into()),
+                ..RawMutator::default()
             }],
             examples: vec![],
         });
@@ -627,7 +656,7 @@ mod tests {
     #[test]
     fn test_rejects_non_loopback_base_url() {
         // Base URL validation is done in validate() once we have the URL parser.
-        // For now, this is tested at the adapter level. We'll add it when the
+        // For now, this is tested at the protocol level. We'll add it when the
         // HttpAdapter validator is implemented.
     }
 
@@ -639,6 +668,8 @@ mod tests {
             max_execs: None,
             duration_s: None,
             seed: None,
+
+            max_fields: None,
         });
         let raw = RawExperiment {
             version: 1,
@@ -666,6 +697,8 @@ mod tests {
             max_execs: None,
             duration_s: None,
             seed: None,
+
+            max_fields: None,
         });
         let raw = RawExperiment {
             version: 1,

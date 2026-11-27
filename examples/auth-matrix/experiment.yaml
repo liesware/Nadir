@@ -2,6 +2,8 @@ version: 1
 
 experiment:
   name: auth-matrix
+  # Values shown as [hidden] wherever they appear (display, records, stderr).
+  hidden: [NADIR_ADMIN_PASSWORD, NADIR_USER_PASSWORD]
   max_cases: 4
   exploration:
     strategy: enumerate

@@ -45,7 +45,7 @@ pub fn check_oracle_objectives(
                 previous_steps: &[],
                 case_id: &case.case_id,
                 step_outputs: &std::collections::HashMap::new(),
-                operation_id: &step.operation_id,
+                operation_id: &step.operation_key,
                 declared_statuses: &step.declared_statuses,
                 schema_cache: &std::collections::HashMap::new(),
             };

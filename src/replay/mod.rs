@@ -14,8 +14,7 @@ use crate::artifacts::{CaseRecord, FindingRecord};
 use crate::config::ResolvedExperiment;
 use crate::evaluation::case::{EvaluatedCase, ExecutedPlan};
 use crate::execution::runner::{CaseResult, WorkflowRunner};
-use crate::experiment::selectors::{parse_input_selector, InputSelector};
-use crate::experiment::types::{Experiment, ReplacementValue};
+use crate::experiment::types::{ExampleCase, Experiment, ReplacementValue};
 use crate::mutation::RegressionVariant;
 use crate::storage;
 
@@ -75,17 +74,18 @@ enum PendingCase {
         variant: RegressionVariant,
         value: ReplacementValue,
     },
-    Example {
-        example_id: String,
-        step_id: String,
-        selector: String,
-        value: ReplacementValue,
-        expect_status: u16,
-    },
+    Example { step_id: String, example: ExampleCase },
     Fuzz {
         case: crate::mutation::fuzz::FuzzCase,
-        seed: u64,
-        iteration: u64,
+        reference: crate::artifacts::FuzzCaseRef,
+    },
+    Corpus {
+        reference: crate::mutation::text::CorpusCaseRef,
+        value: ReplacementValue,
+    },
+    Malform {
+        step_id: String,
+        malformation: crate::adapters::http_raw::Malformation,
     },
     Baseline,
 }
@@ -101,7 +101,11 @@ pub(crate) fn prepare_replay(
     let fingerprints = &configuration.openapi_fingerprints;
     let record = storage::load_case_record(record_path)?;
     let version = record.artifact_version;
-    if version != 1 && version != CaseRecord::CURRENT_VERSION {
+    if !matches!(
+        version,
+        1 | CaseRecord::CURRENT_VERSION | CaseRecord::CORPUS_VERSION | CaseRecord::JSON_EXAMPLE_VERSION
+            | CaseRecord::MALFORM_VERSION
+    ) {
         return Err(ReplayError::InputError(format!(
             "unsupported case record version {version}"
         )));
@@ -109,6 +113,17 @@ pub(crate) fn prepare_replay(
     let plan = record.regression_plan.ok_or_else(|| {
         ReplayError::InputError("record has no replayable regression plan".into())
     })?;
+    if (version == CaseRecord::MALFORM_VERSION) != plan.malform.is_some() {
+        return Err(ReplayError::InputError("invalid malform case record version".into()));
+    }
+    if (version == CaseRecord::CORPUS_VERSION) != plan.corpus.is_some() {
+        return Err(ReplayError::InputError("invalid corpus case record version".into()));
+    }
+    if (version == CaseRecord::JSON_EXAMPLE_VERSION) != plan.json_example.is_some()
+        || (plan.json_example.is_some() && (plan.example_id.is_none() || plan.example_step_id.is_none()))
+    {
+        return Err(ReplayError::InputError("invalid JSON example case record".into()));
+    }
     if plan.experiment_sha256 != configuration.sha256 {
         return Err(ReplayError::InputError(
             "experiment YAML differs from the saved regression plan".into(),
@@ -140,29 +155,76 @@ pub(crate) fn prepare_replay(
     if (plan.example_id.is_none() && plan.example_step_id.is_some())
         || (plan.example_id.is_some() && plan.variant.is_some())
         || (plan.fuzz.is_some() && (plan.variant.is_some() || plan.example_id.is_some()))
+        || (plan.corpus.is_some() && (plan.fuzz.is_some() || plan.variant.is_some() || plan.example_id.is_some()))
     {
         return Err(ReplayError::InputError(
             "saved case has conflicting example or variant identifiers".into(),
         ));
     }
     let pending = match (plan.variant, &plan.example_id) {
+        // A malform case is rebuilt from its name; the step must still run it.
+        (None, None) if plan.malform.is_some() => {
+            let reference = plan.malform.expect("checked above");
+            let malformation = crate::adapters::http_raw::Malformation::from_name(&reference.name)
+                .ok_or_else(|| ReplayError::InputError(format!("unknown malformation '{}'", reference.name)))?;
+            let declared = runner.experiment().steps.iter()
+                .filter(|step| step.id == reference.step_id)
+                .flat_map(|step| &step.mutators)
+                .any(|mutator| matches!(
+                    mutator,
+                    crate::experiment::types::MutatorDecl::Malform { malformations } if malformations.contains(&malformation)
+                ));
+            if !declared {
+                return Err(ReplayError::InputError(format!(
+                    "step '{}' no longer runs malformation '{}'",
+                    reference.step_id, reference.name
+                )));
+            }
+            PendingCase::Malform { step_id: reference.step_id, malformation }
+        }
+        (None, None) if plan.corpus.is_some() => {
+            let reference = plan.corpus.expect("checked above");
+            let corpus = runner.experiment().steps.iter()
+                .find(|step| step.id == reference.step_id)
+                .and_then(|step| step.corpora.get(reference.corpus_index))
+                .ok_or_else(|| ReplayError::InputError("saved corpus is unavailable".into()))?;
+            if corpus.sha256 != reference.sha256 {
+                return Err(ReplayError::InputError("saved corpus fingerprint differs from the current file".into()));
+            }
+            if reference.iteration >= corpus.repetitions {
+                return Err(ReplayError::InputError("saved corpus iteration is outside its repetitions".into()));
+            }
+            let (actual, value) = corpus.case(
+                &reference.step_id, reference.corpus_index, reference.iteration,
+            );
+            if actual != reference {
+                return Err(ReplayError::InputError("saved corpus reference is incompatible with the experiment".into()));
+            }
+            PendingCase::Corpus { reference, value }
+        }
         // A random case is regenerated from its seed and iteration.
         (None, None) if plan.fuzz.is_some() => {
             let reference = plan.fuzz.expect("checked above");
-            let case = crate::mutation::fuzz::generate_case(
+            // Regenerate with the rule and limit the case was saved with.
+            let version = crate::mutation::fuzz::GeneratorVersion::from_number(reference.generator)
+                .ok_or_else(|| {
+                    ReplayError::InputError(format!(
+                        "saved by a newer Nadir (generator {})",
+                        reference.generator
+                    ))
+                })?;
+            let case = crate::mutation::fuzz::generate_case_with(
                 runner.experiment(),
-                runner.http_contract(),
+                |step, selector| runner.baseline_value(step, selector),
                 reference.seed,
                 reference.iteration,
+                version,
+                reference.max_fields,
             )
             .ok_or_else(|| {
                 ReplayError::InputError("the experiment no longer declares mutable fields".into())
             })?;
-            PendingCase::Fuzz {
-                case,
-                seed: reference.seed,
-                iteration: reference.iteration,
-            }
+            PendingCase::Fuzz { case, reference }
         }
         (Some(variant), _) => {
             let value = variant
@@ -207,13 +269,12 @@ pub(crate) fn prepare_replay(
                     "example '{example_id}' is ambiguous without a saved step ID"
                 )));
             }
-            PendingCase::Example {
-                example_id: example_id.clone(),
-                step_id: step.id.clone(),
-                selector: format!("body.{}", example.field),
-                value: ReplacementValue::JsonValue(example.value.clone()),
-                expect_status: example.expect_status,
+            if example.json_example() != plan.json_example.as_ref() {
+                return Err(ReplayError::InputError(
+                    "saved JSON example differs from the experiment".into(),
+                ));
             }
+            PendingCase::Example { step_id: step.id.clone(), example: example.clone() }
         }
         (None, None) => PendingCase::Baseline,
     };
@@ -238,36 +299,38 @@ pub(crate) fn execute_replay(
             };
             (execution, plan)
         }
-        PendingCase::Example {
-            example_id,
-            step_id,
-            selector,
-            value,
-            expect_status,
-        } => {
-            let execution = runner.execute_variant(&step_id, &selector, value.clone())?;
+        PendingCase::Example { step_id, example } => {
+            let execution = runner.execute_example(&step_id, &example)?;
             let plan = ExecutedPlan::Example {
-                example_id,
+                example_id: example.id.clone(),
                 step_id,
-                selector,
-                replacement: value,
-                expect_status,
+                expect_status: example.expect_status,
+                json_example: example.json_example().cloned(),
             };
             (execution, plan)
         }
-        PendingCase::Fuzz {
-            case,
-            seed,
-            iteration,
-        } => {
-            let execution = runner.execute_replacements(&case.step_id, &case.replacements)?;
+        PendingCase::Fuzz { case, reference } => {
+            let execution = runner.execute_fuzz_case(&case)?;
+            let key_expectation = case.key_rename.as_ref().and_then(|rename| rename.expectation());
             let plan = ExecutedPlan::Fuzz {
                 step_id: case.step_id,
                 replacements: case.replacements,
-                seed,
-                iteration,
+                seed: reference.seed,
+                iteration: reference.iteration,
+                generator: reference.generator,
+                max_fields: reference.max_fields,
+                key_expectation,
             };
             (execution, plan)
+        }
+        PendingCase::Corpus { reference, value } => {
+            let selector = format!("body.{}", reference.field);
+            let execution = runner.execute_variant(&reference.step_id, &selector, value)?;
+            (execution, ExecutedPlan::Corpus(reference))
+        }
+        PendingCase::Malform { step_id, malformation } => {
+            let execution = runner.execute_malform(&step_id, malformation)?;
+            (execution, ExecutedPlan::Malform { step_id, malformation })
         }
         PendingCase::Baseline => (runner.execute_baseline()?, ExecutedPlan::Baseline),
     };
@@ -290,52 +353,7 @@ fn selector_in_contract(
         .steps
         .iter()
         .find(|step| step.id == variant.step_id);
-    let operation =
-        step.and_then(|step| runner.http_contract()?.operations.get(&step.operation_id));
-    let Some(operation) = operation else {
-        return false;
-    };
-    match (parse_input_selector(&variant.selector), value) {
-        (Ok(InputSelector::HeaderParam(header)), ReplacementValue::HeaderAscii(value)) => {
-            operation.header_params.iter().any(|param| {
-                param.name.eq_ignore_ascii_case(&header)
-                    && param
-                        .schema
-                        .enum_values
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.contains(value))
-            })
-        }
-        // Typed values and removals come from the field's schema or the
-        // experiment itself, so the field only has to still exist.
-        (Ok(InputSelector::BodyField(path)), ReplacementValue::JsonValue(_))
-        | (Ok(InputSelector::BodyField(path)), ReplacementValue::Absent) => {
-            operation.request_body.as_ref().is_some_and(|body| {
-                path.iter()
-                    .try_fold(&body.schema.0, |schema, field| {
-                        schema.get("properties")?.get(field)
-                    })
-                    .is_some()
-            })
-        }
-        (Ok(InputSelector::BodyField(path)), ReplacementValue::JsonString(_)) => {
-            operation.request_body.as_ref().is_some_and(|body| {
-                path.iter()
-                    .try_fold(&body.schema.0, |schema, field| {
-                        schema.get("properties")?.get(field)
-                    })
-                    .is_some_and(|schema| {
-                        schema.get("type").is_none_or(|kind| {
-                            kind.as_str() == Some("string")
-                                || kind.as_array().is_some_and(|types| {
-                                    types.iter().any(|kind| kind.as_str() == Some("string"))
-                                })
-                        })
-                    })
-            })
-        }
-        _ => false,
-    }
+    step.is_some_and(|step| runner.accepts_variant(step, &variant.selector, value))
 }
 
 /// Replay a saved finding.

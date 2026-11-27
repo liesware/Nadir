@@ -1,8 +1,13 @@
 //! CLI dispatch and regression output.
 
 mod args;
+mod debugger;
+mod incidents;
+mod progress;
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -77,15 +82,48 @@ fn load_configuration(path: &Path) -> Result<config::ResolvedExperiment, String>
 /// Prepare the runner. `target.coverage` is still rejected here, before any
 /// process starts.
 fn regression_runner(configuration: &config::ResolvedExperiment) -> Result<WorkflowRunner, String> {
-    WorkflowRunner::from_resolved(configuration).map_err(|error| error.to_string())
+    let runner = WorkflowRunner::from_resolved(configuration).map_err(|error| error.to_string())?;
+    for name in runner.short_hidden() {
+        eprintln!(
+            "warning: hidden variable '{name}' has fewer than {} characters and is not hidden",
+            crate::inspect::MIN_HIDDEN_LEN
+        );
+    }
+    Ok(runner)
 }
 
 fn cmd_run(path: &Path) -> Result<Exit, String> {
     let configuration = load_configuration(path)?;
     let mut runner = regression_runner(&configuration)?;
+    let progress = Rc::new(RefCell::new(progress::ProgressDisplay::new()));
     let target = start_target(&configuration, &mut runner)?;
     let destination = storage::RunDirectory::reserve(&configuration.directory)
         .map_err(|error| error.to_string())?;
+    eprintln!("Endpoints: {}", runner.endpoint_count());
+    let templates = runner.request_templates();
+    if !templates.is_empty() {
+        let mut display = progress.borrow_mut();
+        if display.interactive() {
+            let width = display.size().0;
+            display.set_print(debugger::template_rows(&templates, width));
+        } else {
+            eprintln!("{}", debugger::template_rows(&templates, 100).join("\n"));
+        }
+    }
+    // Keys are read (raw mode) only while `debug` has something to show.
+    let mut keys = None;
+    if configuration.experiment.steps.iter().any(|step| step.debug.is_some()) {
+        keys = debugger::Keys::start(&progress.borrow());
+        let signals = keys.as_ref().map(debugger::Keys::signals);
+        runner.set_inspector(Some(Box::new(debugger::Debugger::new(progress.clone(), signals))));
+    }
+    let secrets = runner.hidden_values().to_vec();
+    let mut incidents = incidents::IncidentRecorder::default();
+    let mut on_case_evidence = |case: &crate::evaluation::case::EvaluatedCase, number, oracle_evidence| {
+        incidents.record_case(&configuration, case, number, &secrets, oracle_evidence, |kind, row| {
+            progress.borrow_mut().add_evidence(kind, row);
+        });
+    };
     let max_cases = configuration.experiment.max_cases.get();
     let mut budget = match configuration.experiment.exploration.strategy {
         ExplorationStrategy::Enumerate => RunBudget::new(max_cases, None, None),
@@ -99,15 +137,63 @@ fn cmd_run(path: &Path) -> Result<Exit, String> {
             Some(Duration::from_secs(u64::from(duration_s))),
         ),
     };
-    let result = exploration::run_enumeration(&mut runner, &configuration.experiment, &mut budget)
-        .map_err(|error| format!("could not execute the regression workflow: {error}"))?;
+    progress.borrow_mut().start_clock();
+    let result = exploration::enumerate::run_with_progress(
+        &mut runner,
+        &configuration.experiment,
+        &mut budget,
+        &mut |snapshot| progress.borrow_mut().update(snapshot),
+        &mut on_case_evidence,
+    );
+    runner.set_inspector(None);
+    // Restore the terminal before anything else is printed.
+    drop(keys);
+    let mut progress = progress.borrow_mut();
+    let result = result.map_err(|error| match error {
+        crate::execution::runner::RunError::StoppedByUser => {
+            "stopped by the user before the baseline was sent; nothing was recorded".to_owned()
+        }
+        error => format!("could not execute the regression workflow: {error}"),
+    })?;
     let written = destination
-        .write(&configuration, &result, runner.diagnostic_secrets())
+        .write(&configuration, &result, runner.hidden_values(), incidents.transport_errors())
         .map_err(|error| error.to_string())?;
+    let sections = progress.final_sections();
+    let duration = progress.final_duration();
+    progress.clear();
     // The enumeration already waited for any exit in progress.
     finish_target(target, Duration::ZERO);
-    reporting::print_regression_run(path, &result, &written);
+    reporting::print_regression_run(
+        path, &result, &written, &progress.cases_line(), duration.as_deref(), &sections,
+    );
     Ok(regression_exit(result.status()))
+}
+
+fn crash_label(record: &crate::artifacts::CaseRecord) -> String {
+    let malform = record.regression_plan.as_ref().and_then(|plan| plan.malform.as_ref());
+    if let Some(malform) = malform {
+        let observed = record
+            .step_results
+            .iter()
+            .flat_map(|step| &step.oracle_verdicts)
+            .find(|check| check.oracle_id == crate::evaluation::case::WIRE_HANDLED_RULE && check.verdict == "fail")
+            .and_then(|check| check.observed.as_deref())
+            .map(|observed| observed.trim_matches('"').to_owned());
+        if let Some(observed) = observed {
+            return format!("wire:handled · {} · {} · {observed}", malform.step_id, malform.name);
+        }
+    }
+    let failed = record.step_results.iter().find_map(|step| {
+        let check = step.oracle_verdicts.iter().find(|check| check.verdict == "fail")?;
+        Some((check.oracle_id.as_str(), step))
+    });
+    match failed {
+        Some((rule, step)) => match step.status {
+            Some(status) => format!("{rule} · {} · HTTP {status}", step.step_id),
+            None => format!("{rule} · {}", step.step_id),
+        },
+        None => "failed rule".into(),
+    }
 }
 
 fn cmd_replay(path: &Path, record: &Path) -> Result<Exit, String> {
@@ -145,7 +231,7 @@ fn cmd_replay(path: &Path, record: &Path) -> Result<Exit, String> {
         runner.experiment(),
         &result.case,
         0,
-        runner.diagnostic_secrets(),
+        runner.hidden_values(),
     );
     reporting::print_replayed_case(&result.case, &report);
     if target_exited {
@@ -165,7 +251,7 @@ fn start_target(
 ) -> Result<Option<target::RunningTarget>, String> {
     let (Some(target_config), Some(http)) = (
         configuration.experiment.target.as_ref(),
-        configuration.experiment.adapters.http.as_ref(),
+        configuration.experiment.protocols.http.as_ref(),
     ) else {
         return Ok(None);
     };
@@ -173,7 +259,7 @@ fn start_target(
         target_config,
         &http.base_url,
         &configuration.directory,
-        runner.diagnostic_secrets().to_vec(),
+        runner.hidden_values().to_vec(),
     )
     .map_err(|error| error.to_string())?;
     eprintln!(

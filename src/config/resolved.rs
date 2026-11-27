@@ -58,7 +58,7 @@ pub fn load_resolved(path: &Path) -> Result<ResolvedExperiment, LoadError> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut contracts = HashMap::new();
-    if let Some(http) = &raw.experiment.adapters.http {
+    if let Some(http) = &raw.experiment.protocols.http {
         let path = directory.join(&http.openapi);
         let contract = contract::load_contract(&path)
             .map_err(|source| LoadError::Contract { path, source })?;

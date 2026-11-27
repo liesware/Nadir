@@ -13,3 +13,5 @@ pub mod finding;
 pub mod replay;
 pub mod storage;
 pub mod reporting;
+pub mod formats;
+pub mod inspect;

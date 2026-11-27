@@ -212,6 +212,7 @@ fn cli_runs_reports_and_replays_a_local_regression() {
     assert!(output.contains("SetupCheckFailed"), "{output}");
     assert!(output.contains("login-succeeds"), "{output}");
     assert!(output.contains("Enumeration cases: 0"), "{output}");
+    assert!(output.lines().any(|line| line == "Cases: 1"), "{output}");
     drop(normal);
 
     let output = stderr(&cli(&["run", experiment], PASSWORD), 2);
@@ -314,6 +315,51 @@ fn cli_runs_reports_and_replays_a_local_regression() {
     fs::write(&copied, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let output = stderr(&cli(&replay, PASSWORD), 2);
     assert!(output.contains("no replayable regression plan"), "{output}");
+}
+
+#[test]
+fn redirected_progress_counts_unique_endpoints_and_completed_cases() {
+    let directory = TestDirectory::new();
+    let (_fixture, port) = Fixture::start(0, "corrected");
+    let experiment_file = directory.experiment(port);
+    let source = fs::read_to_string(&experiment_file)
+        .unwrap()
+        .replace(
+            "    - id: post_record\n",
+            concat!(
+                "    - id: get_template_again\n",
+                "      adapter: http\n",
+                "      operation_id: getTemplate\n",
+                "      bind:\n",
+                "        path.id: tpl-123\n",
+                "      auth:\n",
+                "        bearer: '${steps.login.outputs.token}'\n",
+                "    - id: post_record\n",
+            ),
+        )
+        .replace(
+            "            mode: edge_cases\n",
+            concat!(
+                "            mode: edge_cases\n",
+                "        examples:\n",
+                "          - id: another-title\n",
+                "            field: title\n",
+                "            value: Progress example\n",
+                "            expect_status: 201\n",
+            ),
+        );
+    fs::write(&experiment_file, source).unwrap();
+    let output = stderr(&cli(&["run", experiment_file.to_str().unwrap()], PASSWORD), 0);
+    assert!(!output.contains('\x1b'), "{output}");
+    for line in ["Endpoints: 4", "Enumeration cases: 8", "Cases: 9/9", "Findings: 0"] {
+        assert_eq!(
+            output.lines().filter(|entry| *entry == line).count(),
+            1,
+            "{output}"
+        );
+    }
+    let run = read_record(&path_from_output(&output, "Run record: "));
+    assert_eq!(run["cases"].as_array().unwrap().len(), 8);
 }
 
 #[test]
@@ -512,7 +558,7 @@ experiment:
     );
     assert_eq!(case.requests_sent, 1);
     assert_eq!(
-        case.step_results[0].observation.as_ref().unwrap().status,
+        case.step_results[0].observation.as_ref().unwrap().http_status().unwrap(),
         200
     );
 }
@@ -753,6 +799,68 @@ fn fixture_command(mode: &str) -> String {
 }
 
 #[test]
+fn supervised_exit_writes_diagnostics_for_baseline_and_variant_without_debug() {
+    for responses_before_exit in [0, 1] {
+        let directory = TestDirectory::new();
+        let port = free_port();
+        let script = r#"
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/service":
+            if self.server.remaining == 0:
+                os._exit(7)
+            self.server.remaining -= 1
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server.remaining = int(sys.argv[2])
+server.serve_forever()
+"#;
+        fs::write(directory.0.join("server.py"), script).unwrap();
+        let contract = serde_json::json!({
+            "openapi":"3.1.0",
+            "paths":{"/service":{"get":{"operationId":"service","responses":{"200":{"description":"OK"}}}}}
+        });
+        fs::write(directory.0.join("contract.json"), contract.to_string()).unwrap();
+        let experiment = serde_json::json!({
+            "version":1, "experiment":{
+                "name":"process-observation", "max_cases":2,
+                "target":{"command":["python3","-I","server.py",port.to_string(),responses_before_exit.to_string()],
+                          "ready":{"path":"/ready"}},
+                "protocols":{"http":{"base_url":format!("http://127.0.0.1:{port}"),"openapi":"contract.json"}},
+                "steps":[{"id":"service","protocol":"http","operation_id":"service",
+                          "cases":{"mutators":[{"use":"headers","fields":["X-Note"],"values":["preview"]}]}}]
+            }
+        });
+        let path = directory.0.join("experiment.yaml");
+        fs::write(&path, experiment.to_string()).unwrap();
+        let output = stderr(&cli_elsewhere(&["run", path.to_str().unwrap()]), 1);
+        assert!(output.contains("Stop reason: ProcessExit"), "{output}");
+        assert!(output.contains("process_exit · service"), "{output}");
+        let run = read_record(&path_from_output(&output, "Run record: "));
+        assert_eq!(run["counters"]["transport_errors"], 0);
+        let dir = directory.0.join("artifacts/crashes");
+        let yaml: Vec<_> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")).collect();
+        assert_eq!(yaml.len(), 1);
+        let evidence: Value = serde_yaml::from_slice(&fs::read(&yaml[0]).unwrap()).unwrap();
+        assert_eq!(evidence["outcome"]["kind"], "process_exit");
+        assert_eq!(evidence["outcome"]["exit_code"], 7);
+        assert_eq!(evidence["step_id"], "service");
+        assert_eq!(evidence["request"]["path_template"], "/service");
+        let record = read_record(&dir.join(evidence["case_record"].as_str().unwrap()));
+        assert_eq!(record["case_id"], evidence["case_id"]);
+        assert_eq!(record["case_number"], responses_before_exit);
+    }
+}
+
+#[test]
 fn cli_starts_watches_and_stops_the_target_process() {
     let directory = TestDirectory::new();
     fs::write(
@@ -813,7 +921,7 @@ fn cli_starts_watches_and_stops_the_target_process() {
     assert!(output.contains("is already accepting connections"), "{output}");
     drop(existing);
 
-    // 4. A target that exits during startup shows its stderr, with secrets redacted,
+    // 4. A target that exits during startup shows its stderr, with hidden values replaced,
     //    and no run directory is created.
     fs::remove_dir_all(directory.0.join(".nadir")).unwrap();
     fs::write(
@@ -828,7 +936,9 @@ fn cli_starts_watches_and_stops_the_target_process() {
     let output = stderr(&cli_elsewhere(&["run", experiment]), 2);
     assert!(output.contains("target exited during readiness check"), "{output}");
     assert!(output.contains("boom-marker"), "{output}");
-    assert!(output.contains("[redacted]"), "{output}");
+    // `hidden` lists the password: only its value is replaced, not the line.
+    assert!(output.contains("password=[hidden]"), "{output}");
+    assert!(!output.contains(PASSWORD), "{output}");
     assert!(!directory.0.join(".nadir").exists());
 
     // 5. A target that never becomes ready is stopped after ready.timeout_ms.
@@ -970,6 +1080,7 @@ fn cli_schema_mode_reports_accepted_invalid_values() {
     let finding = &run["findings"].as_array().unwrap()[0];
     assert_eq!(finding["oracle_id"], "schema:rejects-invalid");
     assert_eq!(finding["occurrence_count"], 7);
+    assert!(output.lines().any(|line| line == "Findings: 1"), "{output}");
 
     // The first accepted case (the missing field) replays with the same result.
     let saved = path_from_output(&output, "case record: ");
@@ -998,6 +1109,7 @@ fn cli_fuzz_runs_random_cases_and_replays_them_from_seed_and_iteration() {
     assert!(output.contains("Random cases: 300 (kept "), "{output}");
     assert!(output.contains("seed 7)"), "{output}");
     assert!(output.contains("Stop reason: MaxExecsReached"), "{output}");
+    assert!(output.lines().any(|line| line == "Cases: 308/308"), "{output}");
     let run = read_record(&path_from_output(&output, "Run record: "));
     assert_eq!(run["fuzz"]["seed"], 7);
     assert_eq!(run["fuzz"]["executed"], 300);

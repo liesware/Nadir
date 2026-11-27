@@ -108,7 +108,14 @@ pub(crate) fn print_check(step_id: &str, step_outcome: &str, check: &VerdictReco
     );
 }
 
-pub(crate) fn print_regression_run(path: &Path, result: &EnumerationResult, written: &WrittenRun) {
+pub(crate) fn print_regression_run(
+    path: &Path,
+    result: &EnumerationResult,
+    written: &WrittenRun,
+    cases_line: &str,
+    duration: Option<&str>,
+    sections: &[String],
+) {
     let cases = written
         .record
         .baseline_case
@@ -202,9 +209,20 @@ pub(crate) fn print_regression_run(path: &Path, result: &EnumerationResult, writ
             );
         }
     }
+    eprintln!("{cases_line}");
+    eprintln!("Findings: {}", written.record.counters.findings_count);
+    if written.record.counters.transport_errors > 0 {
+        eprintln!("Transport errors: {}", written.record.counters.transport_errors);
+    }
+    if let Some(duration) = duration {
+        eprintln!("{duration}");
+    }
+    // The `print` and `debug` sections stay between the counters and the end.
+    if !sections.is_empty() {
+        eprintln!("\n{}", sections.join("\n"));
+    }
     eprintln!(
-        "Findings: {}\nStop reason: {:?}\nRun record: {}",
-        written.record.counters.findings_count,
+        "Stop reason: {:?}\nRun record: {}",
         result.stop_reason,
         written.run_file.display(),
     );
@@ -243,12 +261,16 @@ pub(crate) fn print_replayed_case(evaluated: &EvaluatedCase, record: &CaseRecord
 
 fn print_case_diagnostics(evaluated: &EvaluatedCase, case: &CaseRecord, show_failures: bool) {
     let mut printed_interruption = false;
-    for (result, step) in evaluated
+    for (index, (result, step)) in evaluated
         .execution
         .step_results
         .iter()
         .zip(&case.step_results)
+        .enumerate()
     {
+        if crate::execution::diagnostic::expected_disconnect(evaluated, index) {
+            continue;
+        }
         if let Some(reason) = step.transport_reason {
             if let Some(phase) = step.transport_phase {
                 eprintln!(
@@ -264,7 +286,7 @@ fn print_case_diagnostics(evaluated: &EvaluatedCase, case: &CaseRecord, show_fai
                 || result
                     .observation
                     .as_ref()
-                    .is_some_and(|response| response.truncated))
+                    .is_some_and(|response| response.is_truncated()))
         {
             eprintln!("step {}: {}", step.step_id, step.outcome);
             printed_interruption = true;

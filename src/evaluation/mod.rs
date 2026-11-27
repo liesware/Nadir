@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 
 use crate::adapters::http::transport::HttpObservation;
+use crate::observation::StepObservation;
 use crate::execution::runner::StepResult;
 use crate::experiment::selectors::ObservationSelector;
 use crate::experiment::types::{ExpectCondition, OracleDecl, OracleType};
-use crate::observation::{select_response, ObservationError, SelectedValue};
+use crate::observation::{ObservationError, SelectedValue};
 
 use serde_json::Value;
 pub mod case;
@@ -42,6 +43,8 @@ pub enum ViolationCategory {
     Assertion,
     /// The service answered with a 5xx status.
     ServerError,
+    /// The service neither answered nor closed the connection in time.
+    Unresponsive,
 }
 
 // ── Oracle context ─────────────────────────────────────────────────
@@ -55,12 +58,12 @@ pub struct OracleContext<'a> {
     pub case_id: &'a str,
     /// Flattened step outputs: key = "step_id.output_name".
     pub step_outputs: &'a HashMap<String, Value>,
-    /// The OpenAPI operation ID for this step, used to look up response schemas.
+    /// The operation's internal method and path key, used to look up response schemas.
     pub operation_id: &'a str,
     /// Status codes the operation documents (`0` is `default`); empty when unknown.
     pub declared_statuses: &'a [u16],
     /// Pre-compiled schema validators for the run.
-    /// Key: `(operation_id, status_code)`.
+    /// Key: `(operation key, status code)`.
     pub schema_cache: &'a SchemaValidatorCache,
 }
 
@@ -120,12 +123,12 @@ fn evaluate_rule(
     }
     match oracle_type {
         OracleType::OpenApi => make(
-            evaluate_openapi(ctx.current_step.observation.as_ref(), ctx.declared_statuses),
+            evaluate_openapi(ctx.current_step.observation.as_ref().and_then(StepObservation::as_http), ctx.declared_statuses),
             None,
             None,
         ),
         OracleType::OpenApiSchema => schema_evaluation(
-            ctx.current_step.observation.as_ref(),
+            ctx.current_step.observation.as_ref().and_then(StepObservation::as_http),
             ctx.operation_id,
             ctx.schema_cache,
         ),
@@ -173,10 +176,10 @@ fn evaluate_rule(
                 .current_step
                 .observation
                 .as_ref()
-                .expect("response already checked");
-            match response.status {
-                404 => make(Verdict::Pass, None, None),
-                200 if oracle.record_reference.as_ref().is_none_or(|selector| {
+                .and_then(StepObservation::as_http);
+            match response.map(|response| response.status) {
+                Some(404) => make(Verdict::Pass, None, None),
+                Some(200) if oracle.record_reference.as_ref().is_none_or(|selector| {
                     matches!(resolve_observation_selector(selector, ctx), SelectedValue::Present(value) if !value.is_null())
                 }) => make(Verdict::Fail { category: ViolationCategory::Security }, None, None),
                 _ => make(Verdict::Inconclusive, None, Some("response did not establish record presence")),
@@ -209,7 +212,7 @@ pub fn evaluate_openapi(observation: Option<&HttpObservation>, declared: &[u16])
         || !documented
         || (json
             && !response.body.is_empty()
-            && serde_json::from_slice::<Value>(&response.body).is_err())
+            && crate::formats::json::decode(&response.body).is_err())
     {
         Verdict::Fail {
             category: ViolationCategory::Conformance,
@@ -271,7 +274,7 @@ fn schema_evaluation(
         ResponseCheck::Json(_) if response.body.is_empty() => {
             fail("response requires a JSON body", response_location())
         }
-        ResponseCheck::Json(validator) => match serde_json::from_slice::<Value>(&response.body) {
+        ResponseCheck::Json(validator) => match crate::formats::json::decode(&response.body) {
             Err(_) => fail("response body is not valid JSON", response_location()),
             Ok(instance) => match validator.validate(&instance) {
                 Ok(()) => make(Verdict::Pass, None, None),
@@ -305,7 +308,7 @@ fn values_equal(first: &Value, second: &Value) -> bool {
     }
 }
 
-fn available_response(step: &StepResult) -> Result<&HttpObservation, ObservationError> {
+fn available_response(step: &StepResult) -> Result<&StepObservation, ObservationError> {
     if step.outcome != crate::execution::runner::StepOutcome::Completed {
         return Err(ObservationError::NoResponse);
     }
@@ -313,7 +316,7 @@ fn available_response(step: &StepResult) -> Result<&HttpObservation, Observation
         .observation
         .as_ref()
         .ok_or(ObservationError::NoResponse)?;
-    if response.truncated {
+    if response.is_truncated() {
         Err(ObservationError::ResponseLimit)
     } else {
         Ok(response)
@@ -338,7 +341,7 @@ pub(crate) fn resolve_observation_selector(
         selector => (selector, ctx.current_step),
     };
     match available_response(step) {
-        Ok(response) => select_response(selector, response),
+        Ok(response) => response.select(selector),
         Err(error) => SelectedValue::Unavailable(error),
     }
 }
@@ -355,14 +358,15 @@ mod tests {
 
     fn make_step_result(status: u16, body: &[u8]) -> StepResult {
         StepResult {
+            request_diagnostic: None,
             step_id: "test".into(),
             outcome: StepOutcome::Completed,
-            observation: Some(HttpObservation {
+            observation: Some(StepObservation::Http(HttpObservation {
                 status,
                 headers: vec![("content-type".into(), "application/json".into())],
                 body: body.to_vec(),
                 truncated: false,
-            }),
+            })),
             extracted_outputs: HashMap::new(),
             sensitive_response: false,
         }
@@ -467,6 +471,7 @@ mod tests {
     #[test]
     fn test_openapi_inconclusive_on_transport_error() {
         let step = StepResult {
+            request_diagnostic: None,
             step_id: "test".into(),
             outcome: StepOutcome::TransportError {
                 error: "timeout".into(),
@@ -645,7 +650,10 @@ mod tests {
         };
         no_response.observation = None;
         let mut truncated = make_step_result(200, b"{}");
-        truncated.observation.as_mut().unwrap().truncated = true;
+        let Some(StepObservation::Http(response)) = &mut truncated.observation else {
+            panic!("expected an HTTP observation");
+        };
+        response.truncated = true;
         let invalid_json = make_step_result(200, b"incomplete");
         for step in [&no_response, &truncated, &invalid_json] {
             for expect in [

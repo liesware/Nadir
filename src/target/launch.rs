@@ -88,8 +88,6 @@ pub fn launch(
     };
     config.cwd = Some(cwd.to_string_lossy().into_owned());
 
-    let mut secrets = secrets;
-    secrets.extend(config.env.values().cloned());
 
     let mut process =
         ManagedTarget::start(&config, address.port()).map_err(|error| LaunchError::Startup {
@@ -204,7 +202,7 @@ fn socket_address(base_url: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, url.port_or_known_default()?))
 }
 
-/// The last lines of stderr, with lines that contain a secret replaced.
+/// The last lines of stderr, with each hidden value replaced by `[hidden]`.
 fn stderr_excerpt(stderr: &[u8], secrets: &[String]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let lines: Vec<&str> = text.lines().collect();
@@ -214,11 +212,8 @@ fn stderr_excerpt(stderr: &[u8], secrets: &[String]) -> String {
     let start = lines.len().saturating_sub(STDERR_EXCERPT_LINES);
     let mut excerpt = format!("\n--- last {} lines of target stderr ---", lines.len() - start);
     for line in &lines[start..] {
-        let secret = secrets
-            .iter()
-            .any(|secret| secret.len() >= 4 && line.contains(secret.as_str()));
         excerpt.push('\n');
-        excerpt.push_str(if secret { "[redacted]" } else { line });
+        excerpt.push_str(&crate::inspect::redact(line, secrets));
     }
     excerpt
 }
@@ -254,14 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn stderr_excerpt_keeps_the_tail_and_redacts_secrets() {
+    fn stderr_excerpt_keeps_the_tail_and_hides_values() {
         let stderr: String = (1..=30).map(|n| format!("line {n}\n")).collect::<String>()
             + "password is hunter22\n";
         let excerpt = stderr_excerpt(stderr.as_bytes(), &["hunter22".into(), "1".into()]);
         assert!(excerpt.contains("last 20 lines"), "{excerpt}");
         assert!(!excerpt.contains("line 11\n"), "{excerpt}");
         assert!(excerpt.contains("line 30"), "{excerpt}");
-        assert!(excerpt.ends_with("[redacted]"), "{excerpt}");
+        assert!(excerpt.ends_with("password is [hidden]"), "{excerpt}");
+        // Values shorter than four characters are never hidden.
+        assert!(excerpt.contains("line 21"), "{excerpt}");
         assert!(!excerpt.contains("hunter22"), "{excerpt}");
         assert_eq!(stderr_excerpt(b"", &[]), "");
     }

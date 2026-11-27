@@ -26,8 +26,12 @@ pub struct RawExperimentBlock {
     pub exploration: Option<RawExploration>,
     #[serde(default)]
     pub target: Option<RawTarget>,
-    pub adapters: RawAdapters,
+    #[serde(alias = "adapters")]
+    pub protocols: RawProtocols,
     pub steps: Vec<RawStep>,
+    /// Environment variables whose values are shown as `[hidden]`.
+    #[serde(default)]
+    pub hidden: Option<Vec<String>>,
 }
 
 /// Exploration strategy declaration.
@@ -41,6 +45,9 @@ pub struct RawExploration {
     pub duration_s: Option<u32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Most distinct parts one random case changes (default: all).
+    #[serde(default)]
+    pub max_fields: Option<u16>,
 }
 
 /// Target process configuration.
@@ -92,15 +99,15 @@ fn default_map_size() -> usize {
 /// Adapter declarations keyed by name.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawAdapters {
+pub struct RawProtocols {
     #[serde(default)]
-    pub http: Option<RawHttpAdapter>,
+    pub http: Option<RawHttpProtocol>,
 }
 
-/// HTTP adapter configuration.
+/// HTTP protocol configuration.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawHttpAdapter {
+pub struct RawHttpProtocol {
     pub base_url: String,
     pub openapi: String,
     #[serde(default = "default_http_timeout_ms")]
@@ -116,8 +123,12 @@ fn default_http_timeout_ms() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct RawStep {
     pub id: String,
-    pub adapter: String,
-    pub operation_id: String,
+    #[serde(alias = "adapter")]
+    pub protocol: String,
+    pub format: Option<String>,
+    pub operation_id: Option<String>,
+    pub operation_path: Option<String>,
+    pub body_example: Option<serde_json::Value>,
     #[serde(default)]
     pub bind: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
@@ -128,6 +139,44 @@ pub struct RawStep {
     pub cases: Option<RawStepCases>,
     #[serde(default)]
     pub oracles: Vec<RawOracle>,
+    /// Show the request template of this step in the run display.
+    #[serde(default)]
+    pub print: Option<bool>,
+    /// Show each request of this step before sending it.
+    #[serde(default)]
+    pub debug: Option<RawDebug>,
+}
+
+/// `debug: true` waits for a key; `debug: {auto: N}` advances every N seconds.
+#[derive(Debug)]
+pub enum RawDebug {
+    Enabled(bool),
+    Auto(RawDebugAuto),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDebugAuto {
+    pub auto: u32,
+}
+
+impl<'de> Deserialize<'de> for RawDebug {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            Enabled(bool),
+            Auto(RawDebugAuto),
+        }
+        match Form::deserialize(deserializer) {
+            Ok(Form::Enabled(enabled)) => Ok(Self::Enabled(enabled)),
+            Ok(Form::Auto(auto)) => Ok(Self::Auto(auto)),
+            Err(_) => Err(serde::de::Error::custom(
+                "debug must be true, false or {auto: N} with N in seconds \
+                 (for auto write `debug: {auto: 10}`; `debug: true` cannot also hold auto)",
+            )),
+        }
+    }
 }
 
 /// Authentication declaration.
@@ -164,15 +213,17 @@ pub struct RawStepCases {
 pub struct RawExample {
     pub id: String,
     /// Dot-separated body field selector (e.g., "title").
-    pub field: String,
+    pub field: Option<String>,
     /// The value to substitute for this field.
-    pub value: serde_json::Value,
+    #[serde(default, deserialize_with = "present_value")]
+    pub value: Option<serde_json::Value>,
+    pub syntax: Option<String>,
     /// Expected HTTP status code for this example case.
     pub expect_status: u16,
 }
 
 /// A single mutator declaration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawMutator {
     pub r#use: String,
@@ -183,6 +234,23 @@ pub struct RawMutator {
     pub values: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub mode: Option<String>,
+    pub path: Option<String>,
+    pub repetitions: Option<u16>,
+    pub seed: Option<u64>,
+    pub length: Option<RawLength>,
+    pub keys: Option<Vec<String>>,
+    pub rename_to: Option<Vec<String>>,
+    pub expect_status: Option<u16>,
+    /// `use: malform`: the catalog entries to run (default: all).
+    #[serde(default)]
+    pub only: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawLength {
+    pub reference: Option<usize>,
+    pub max: Option<usize>,
 }
 
 /// A single oracle declaration within a step.

@@ -8,13 +8,14 @@
 //! are excluded.
 
 pub mod fuzz;
+pub mod text;
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::adapters::http::contract::{build_baseline_input, ResolvedContract};
+use crate::adapters::http::{contract::ResolvedContract, execution::baseline_value};
 use crate::experiment::types::{
     Experiment, FieldSchema, JsonMutatorMode, MutatorDecl, ReplacementValue, Step,
 };
@@ -30,12 +31,24 @@ pub struct PartDescriptor {
     pub input_kind: InputKind,
     pub representation: ValueRepresentation,
     pub mutation_mode: Option<JsonMutatorMode>,
+    /// Index in the step's `mutators` this descriptor came from, so a part
+    /// with several mutators uses each one's own catalog. `None` matches
+    /// the first mutator that lists the part.
+    pub mutator_index: Option<usize>,
+}
+
+impl PartDescriptor {
+    /// Whether mutator `index` of the step is the one this descriptor uses.
+    fn uses_mutator(&self, index: usize) -> bool {
+        self.mutator_index.is_none_or(|own| own == index)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputKind {
     JsonField,
     HeaderField,
+    PathField,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,7 +125,10 @@ enum VariantId {
     EmptyObject,
     /// A value from the mutator's `values` list, by position.
     Custom(usize),
+    /// Saved by `use: headers` before `use: http`; resolves as `Custom`.
     Header(usize),
+    /// `use: http`, `mode: absent`: the header is left out.
+    Absent,
 }
 
 const EDGE_CASES_V1: [VariantId; 5] = [
@@ -171,13 +187,74 @@ const MAX_GENERATED_LENGTH: u64 = 1 << 20;
 /// Largest `maxItems` for which `mode: schema` builds an oversized array.
 const MAX_GENERATED_ITEMS: u64 = 1000;
 
-/// The named values a JSON descriptor enumerates, in order: the mode's
-/// catalog followed by the mutator's custom `values`.
+/// The named values a descriptor enumerates, in order: the mode's catalog
+/// followed by the mutator's custom `values`.
+fn field_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, ReplacementValue)> {
+    if descriptor.input_kind != InputKind::JsonField {
+        return http_variants(step, descriptor);
+    }
+    json_variants(step, descriptor)
+}
+
+/// Header and path values for `use: http`. Headers skip what the client
+/// cannot send (a NUL byte); schema values that are not text go as text.
+fn http_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, ReplacementValue)> {
+    let header = descriptor.input_kind == InputKind::HeaderField;
+    let as_text = |value: ReplacementValue| -> Option<ReplacementValue> {
+        let text = match value {
+            ReplacementValue::JsonString(text) | ReplacementValue::HeaderAscii(text) => text,
+            ReplacementValue::JsonValue(Value::String(text)) => text,
+            ReplacementValue::JsonValue(other) => other.to_string(),
+            ReplacementValue::Absent => return Some(ReplacementValue::Absent),
+        };
+        if header {
+            text.chars()
+                .all(crate::mutation::text::header_safe)
+                .then_some(ReplacementValue::HeaderAscii(text))
+        } else {
+            Some(ReplacementValue::JsonString(text))
+        }
+    };
+    for (index, mutator) in step.mutators.iter().enumerate() {
+        let MutatorDecl::Http { fields, mode, values, field_schemas } = mutator else {
+            continue;
+        };
+        if !descriptor.uses_mutator(index) {
+            continue;
+        }
+        if !fields.iter().any(|field| field.selector() == descriptor.canonical_selector) {
+            continue;
+        }
+        let catalog: Vec<(VariantId, ReplacementValue)> = match mode {
+            JsonMutatorMode::EdgeCases => EDGE_CASES.iter().filter_map(|id| Some((*id, id.json_value()?))).collect(),
+            JsonMutatorMode::Unconstrained => {
+                UNCONSTRAINED.iter().filter_map(|id| Some((*id, id.json_value()?))).collect()
+            }
+            JsonMutatorMode::Schema => field_schemas
+                .get(&descriptor.canonical_selector)
+                .map(schema_variants)
+                .unwrap_or_default(),
+            JsonMutatorMode::Absent => vec![(VariantId::Absent, ReplacementValue::Absent)],
+            JsonMutatorMode::Values | JsonMutatorMode::Alphanumeric | JsonMutatorMode::Text(_) => Vec::new(),
+        };
+        let custom = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (VariantId::Custom(index), ReplacementValue::JsonString(value.clone())));
+        return catalog
+            .into_iter()
+            .chain(custom)
+            .filter_map(|(id, value)| Some((id, as_text(value)?)))
+            .collect();
+    }
+    Vec::new()
+}
+
 fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, ReplacementValue)> {
     let Some(field) = descriptor.canonical_selector.strip_prefix("body.") else {
         return Vec::new();
     };
-    for mutator in &step.mutators {
+    for (index, mutator) in step.mutators.iter().enumerate() {
         let MutatorDecl::Json {
             fields,
             mode,
@@ -187,6 +264,9 @@ fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, Re
         else {
             continue;
         };
+        if !descriptor.uses_mutator(index) {
+            continue;
+        }
         if !fields.iter().flatten().any(|candidate| candidate == field) {
             continue;
         }
@@ -203,6 +283,10 @@ fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, Re
                 .get(field)
                 .map(schema_variants)
                 .unwrap_or_default(),
+            JsonMutatorMode::Alphanumeric
+            | JsonMutatorMode::Text(_)
+            | JsonMutatorMode::Absent
+            | JsonMutatorMode::Values => Vec::new(),
         };
         variants.extend(values.iter().enumerate().map(|(index, value)| {
             let value = match value {
@@ -355,17 +439,10 @@ impl RegressionVariant {
             .steps
             .iter()
             .find(|step| step.id == descriptor.step_id)?;
-        let variant_id = match descriptor.input_kind {
-            InputKind::HeaderField => VariantId::Header(
-                enumerate_values_for_descriptor(step, descriptor)
-                    .iter()
-                    .position(|item| item == value)?,
-            ),
-            InputKind::JsonField => json_variants(step, descriptor)
-                .into_iter()
-                .find(|(_, candidate)| candidate == value)?
-                .0,
-        };
+        let variant_id = field_variants(step, descriptor)
+            .into_iter()
+            .find(|(_, candidate)| candidate == value)?
+            .0;
         Some(Self {
             step_id: descriptor.step_id.clone(),
             selector: descriptor.canonical_selector.clone(),
@@ -419,28 +496,22 @@ impl RegressionVariant {
             })
             .find_map(|descriptor| {
                 let id = match (&self.identity, artifact_version, descriptor.input_kind) {
-                    (VariantIdentity::Stable { variant_id }, 2, _) => *variant_id,
-                    (VariantIdentity::Legacy { choice }, 1, InputKind::HeaderField) => {
-                        VariantId::Header(*choice)
+                    // `use: headers` saved its values by position.
+                    (VariantIdentity::Stable { variant_id: VariantId::Header(option) }, 2, _)
+                    | (VariantIdentity::Legacy { choice: option }, 1, InputKind::HeaderField) => {
+                        VariantId::Custom(*option)
                     }
+                    (VariantIdentity::Stable { variant_id }, 2, _) => *variant_id,
                     (VariantIdentity::Legacy { choice }, 1, InputKind::JsonField) => {
                         *EDGE_CASES_V1.get(*choice)?
                     }
                     _ => return None,
                 };
-                match (descriptor.input_kind, id) {
-                    (InputKind::HeaderField, VariantId::Header(option)) => {
-                        enumerate_values_for_descriptor(step, &descriptor)
-                            .into_iter()
-                            .nth(option)
-                    }
-                    // Only names the step currently enumerates resolve.
-                    (InputKind::JsonField, _) => json_variants(step, &descriptor)
-                        .into_iter()
-                        .find(|(candidate, _)| *candidate == id)
-                        .map(|(_, value)| value),
-                    _ => None,
-                }
+                // Only names the step currently enumerates resolve.
+                field_variants(step, &descriptor)
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, value)| value)
             })
     }
 }
@@ -454,6 +525,13 @@ impl VariantGenerator {
     /// The contract provides the values the baseline request sends (the
     /// operation example plus bindings), used to skip "unchanged" variants.
     pub fn enumerate(experiment: &Experiment, contract: Option<&ResolvedContract>) -> Vec<CasePlan> {
+        Self::enumerate_with(experiment, |step, selector| baseline_value(contract?, step, selector))
+    }
+
+    pub(crate) fn enumerate_with(
+        experiment: &Experiment,
+        baseline: impl Fn(&Step, &str) -> Option<ReplacementValue>,
+    ) -> Vec<CasePlan> {
         // 1. Build the canonical descriptor list
         let descriptors = build_descriptors(experiment);
         if descriptors.is_empty() {
@@ -461,7 +539,7 @@ impl VariantGenerator {
         }
 
         // 2. Collect baseline values for each descriptor
-        let baseline_values = collect_baseline_values(experiment, contract, &descriptors);
+        let baseline_values = collect_baseline_values(experiment, baseline, &descriptors);
 
         // 3. Generate all variant values
         let mut all_variants: Vec<(usize, ReplacementValue)> = Vec::new();
@@ -509,7 +587,7 @@ impl VariantGenerator {
 
 // ── Descriptor construction ────────────────────────────────────────
 
-fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> {
+pub(crate) fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> {
     let mut descriptors = Vec::new();
 
     for step in &experiment.steps {
@@ -526,8 +604,10 @@ fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> {
             })
             .collect();
 
-        for mutator in &step.mutators {
+        for (mutator_index, mutator) in step.mutators.iter().enumerate() {
             match mutator {
+                // Malformations are enumerated cases, not parts to mutate.
+                MutatorDecl::Malform { .. } => {}
                 MutatorDecl::Json { fields, mode, .. } => {
                     let field_list = fields.clone().unwrap_or_default();
                     for field in &field_list {
@@ -542,18 +622,26 @@ fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> {
                             input_kind: InputKind::JsonField,
                             representation: ValueRepresentation::JsonString,
                             mutation_mode: Some(*mode),
+                            mutator_index: Some(mutator_index),
                         });
                     }
                 }
-                MutatorDecl::Headers { fields, values: _ } => {
+                // Bound header and path values are mutated too: each case
+                // replaces the bound value.
+                MutatorDecl::Http { fields, mode, .. } => {
                     for field in fields {
-                        let canonical = format!("header.{}", field);
+                        let (input_kind, representation) = if field.is_header() {
+                            (InputKind::HeaderField, ValueRepresentation::HeaderAscii)
+                        } else {
+                            (InputKind::PathField, ValueRepresentation::JsonString)
+                        };
                         descriptors.push(PartDescriptor {
                             step_id: step.id.clone(),
-                            canonical_selector: canonical,
-                            input_kind: InputKind::HeaderField,
-                            representation: ValueRepresentation::HeaderAscii,
-                            mutation_mode: None,
+                            canonical_selector: field.selector(),
+                            input_kind,
+                            representation,
+                            mutation_mode: Some(*mode),
+                            mutator_index: Some(mutator_index),
                         });
                     }
                 }
@@ -570,87 +658,31 @@ fn enumerate_values_for_descriptor(
     step: &Step,
     descriptor: &PartDescriptor,
 ) -> Vec<ReplacementValue> {
-    for mutator in &step.mutators {
-        match mutator {
-            MutatorDecl::Headers { fields, values } => {
-                if fields
-                    .iter()
-                    .any(|f| descriptor.canonical_selector == format!("header.{}", f))
-                {
-                    return values
-                        .iter()
-                        .map(|v| ReplacementValue::HeaderAscii(v.clone()))
-                        .collect();
-                }
-            }
-            MutatorDecl::Json { fields, .. } => {
-                if fields
-                    .iter()
-                    .flatten()
-                    .any(|f| descriptor.canonical_selector == format!("body.{}", f))
-                {
-                    return json_variants(step, descriptor)
-                        .into_iter()
-                        .map(|(_, value)| value)
-                        .collect();
-                }
-            }
-        }
-    }
-    Vec::new()
+    field_variants(step, descriptor).into_iter().map(|(_, value)| value).collect()
 }
 
 // ── Baseline value collection ──────────────────────────────────────
 
 /// The value each JSON descriptor has in the baseline request body.
 ///
-/// Mutated fields cannot be bound (static validation), so their baseline
-/// value is static: the operation's request example with literal bindings
-/// applied. Headers have no baseline value: a mutated header is only sent
-/// by its variants.
+/// Mutated body fields cannot be bound (static validation), so their
+/// baseline value is static: the operation's request example with literal
+/// bindings applied. Header and path values come from literal bindings; an
+/// unbound or runtime-bound one has no static baseline value.
 fn collect_baseline_values(
     experiment: &Experiment,
-    contract: Option<&ResolvedContract>,
+    baseline: impl Fn(&Step, &str) -> Option<ReplacementValue>,
     descriptors: &[PartDescriptor],
 ) -> HashMap<usize, ReplacementValue> {
-    let mut values = HashMap::new();
-    let Some(contract) = contract else {
-        return values;
-    };
-
-    for (desc_idx, descriptor) in descriptors.iter().enumerate() {
-        if descriptor.input_kind != InputKind::JsonField {
-            continue;
-        }
-        let Some(step) = experiment.steps.iter().find(|step| step.id == descriptor.step_id) else {
-            continue;
-        };
-        let Some(operation) = contract.operations.get(&step.operation_id) else {
-            continue;
-        };
-        let Ok(body) = build_baseline_input(operation, &step.bindings) else {
-            continue;
-        };
-        let Some(path) = descriptor.canonical_selector.strip_prefix("body.") else {
-            continue;
-        };
-        if let Some(value) = json_at_path(&body, path) {
-            values.insert(
-                desc_idx,
-                match value {
-                    Value::String(text) => ReplacementValue::JsonString(text.clone()),
-                    other => ReplacementValue::JsonString(other.to_string()),
-                },
-            );
-        }
-    }
-
-    values
-}
-
-/// Look up a dotted path (`metadata.source`) in a JSON value.
-fn json_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.').try_fold(value, |current, key| current.get(key))
+    descriptors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, descriptor)| {
+            let step = experiment.steps.iter().find(|step| step.id == descriptor.step_id)?;
+            let value = baseline(step, &descriptor.canonical_selector)?;
+            Some((index, value))
+        })
+        .collect()
 }
 
 // ── Token dictionary ───────────────────────────────────────────────
@@ -664,7 +696,8 @@ pub fn build_token_dictionary(experiment: &Experiment) -> Vec<Vec<u8>> {
     for step in &experiment.steps {
         for mutator in &step.mutators {
             match mutator {
-                MutatorDecl::Headers { values, .. } => {
+                MutatorDecl::Malform { .. } => {}
+                MutatorDecl::Http { values, .. } => {
                     for v in values {
                         let bytes = v.as_bytes().to_vec();
                         if bytes.len() <= max_token_size && tokens.len() < max_tokens {
@@ -711,9 +744,134 @@ mod tests {
     use crate::experiment;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn examples_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+    }
+
+    /// An experiment over `/items/{id}` with a declared `X-Level` header.
+    fn http_experiment(mutators: &str) -> Experiment {
+        let directory = std::env::temp_dir().join(format!("nadir-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("openapi.yaml"), r#"
+openapi: 3.1.0
+info: {title: t, version: "1"}
+paths:
+  /items/{id}:
+    get:
+      operationId: getItem
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string, maxLength: 4}}
+        - {name: X-Level, in: header, required: true, schema: {type: integer, enum: [1, 2]}}
+      responses: {"200": {description: OK}}
+"#).unwrap();
+        std::fs::write(directory.join("experiment.yaml"), format!(r#"
+version: 1
+experiment:
+  name: http
+  max_cases: 100
+  adapters:
+    http: {{base_url: "http://127.0.0.1:9", openapi: ./openapi.yaml}}
+  steps:
+    - id: item
+      adapter: http
+      operation_id: getItem
+      bind: {{path.id: abc, header.X-Level: "1"}}
+      cases:
+        mutators:
+{mutators}
+"#)).unwrap();
+        let resolved = config::load_resolved(&directory.join("experiment.yaml")).unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+        Arc::try_unwrap(resolved.experiment).unwrap_or_else(|shared| (*shared).clone())
+    }
+
+    fn variants_for(experiment: &Experiment, selector: &str) -> Vec<(VariantId, ReplacementValue)> {
+        let descriptor = build_descriptors(experiment)
+            .into_iter()
+            .find(|descriptor| descriptor.canonical_selector == selector)
+            .unwrap();
+        field_variants(&experiment.steps[0], &descriptor)
+    }
+
+    #[test]
+    fn http_catalogs_follow_what_each_location_can_carry() {
+        let experiment = http_experiment(r#"
+          - use: http
+            fields: [header.X-Trace, path.id]
+            mode: unconstrained
+            values: ["../x"]"#);
+        let header = variants_for(&experiment, "header.X-Trace");
+        assert!(header.iter().all(|(id, value)| *id != VariantId::NulByte
+            && matches!(value, ReplacementValue::HeaderAscii(_))));
+        assert!(header.contains(&(VariantId::Custom(0), ReplacementValue::HeaderAscii("../x".into()))));
+        let path = variants_for(&experiment, "path.id");
+        assert!(path.contains(&(VariantId::NulByte, ReplacementValue::JsonString("\u{0}".into()))));
+        assert_eq!(path.len(), header.len() + 1);
+    }
+
+    #[test]
+    fn http_schema_mode_uses_the_parameter_schema_and_bound_values_mutate() {
+        let experiment = http_experiment(r#"
+          - use: http
+            fields: [header.X-Level, path.id]
+            mode: schema
+          - use: http
+            fields: [header.X-Gone]
+            mode: absent"#);
+        let level = variants_for(&experiment, "header.X-Level");
+        let text = |value: &str| ReplacementValue::HeaderAscii(value.into());
+        assert!(level.contains(&(VariantId::MissingField, ReplacementValue::Absent)));
+        assert!(level.contains(&(VariantId::WrongTypeString, text("nadir"))));
+        assert!(level.contains(&(VariantId::NullValue, text("null"))));
+        assert!(level.contains(&(VariantId::NotInEnum, text("987654321"))));
+        let path = variants_for(&experiment, "path.id");
+        assert!(path.contains(&(VariantId::OverMaxLength, ReplacementValue::JsonString("aaaaa".into()))));
+        assert_eq!(variants_for(&experiment, "header.X-Gone"), vec![(VariantId::Absent, ReplacementValue::Absent)]);
+        // Both bound values are mutated: one plan per variant.
+        let plans = VariantGenerator::enumerate_with(&experiment, |_, _| None);
+        assert_eq!(plans.len(), level.len() + path.len() + 1);
+    }
+
+    #[test]
+    fn each_mutator_of_a_part_uses_its_own_catalog() {
+        let experiment = http_experiment(r#"
+          - use: http
+            fields: [header.X-Trace]
+            mode: absent
+          - use: http
+            fields: [header.X-Trace]
+            mode: values
+            values: ["kept"]"#);
+        let catalogs: Vec<Vec<ReplacementValue>> = build_descriptors(&experiment)
+            .iter()
+            .filter(|descriptor| descriptor.canonical_selector == "header.X-Trace")
+            .map(|descriptor| enumerate_values_for_descriptor(&experiment.steps[0], descriptor))
+            .collect();
+        assert_eq!(catalogs, vec![
+            vec![ReplacementValue::Absent],
+            vec![ReplacementValue::HeaderAscii("kept".into())],
+        ]);
+        // Enumeration runs both, once each.
+        let plans = VariantGenerator::enumerate_with(&experiment, |_, _| None);
+        assert_eq!(plans.len(), 2);
+    }
+
+    #[test]
+    fn records_saved_by_use_headers_still_replay() {
+        let experiment = http_experiment(r#"
+          - use: headers
+            fields: [X-Old]
+            values: ["a", "b"]"#);
+        let saved: RegressionVariant = serde_json::from_value(serde_json::json!({
+            "step_id": "item", "selector": "header.X-Old", "variant_id": {"kind": "header", "option": 1}
+        })).unwrap();
+        assert_eq!(saved.resolve(&experiment, 2), Some(ReplacementValue::HeaderAscii("b".into())));
+        let legacy: RegressionVariant = serde_json::from_value(serde_json::json!({
+            "step_id": "item", "selector": "header.X-Old", "choice": 0
+        })).unwrap();
+        assert_eq!(legacy.resolve(&experiment, 1), Some(ReplacementValue::HeaderAscii("a".into())));
     }
 
     fn load_experiment(name: &str) -> Experiment {
@@ -827,10 +985,10 @@ mod tests {
 
     #[test]
     fn test_skips_values_equal_to_the_request_example() {
-        let exp = load_experiment("create-record");
-        let mut contract = create_record_contract();
-        let title_variants = |contract: &ResolvedContract| {
-            VariantGenerator::enumerate(&exp, Some(contract))
+        let mut exp = load_experiment("create-record");
+        let contract = create_record_contract();
+        let title_variants = |exp: &Experiment| {
+            VariantGenerator::enumerate(exp, Some(&contract))
                 .iter()
                 .filter(|plan| {
                     plan.descriptors
@@ -840,18 +998,13 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(title_variants(&contract), 5);
+        assert_eq!(title_variants(&exp), 5);
 
         // The baseline request now sends "RESERVED", so that variant is unchanged.
-        let body = contract
-            .operations
-            .get_mut("createRecord")
-            .unwrap()
-            .request_body
-            .as_mut()
+        let step = exp.steps.iter_mut().find(|step| step.id == "post_record")
             .unwrap();
-        body.example.as_mut().unwrap()["title"] = Value::String("RESERVED".into());
-        assert_eq!(title_variants(&contract), 4);
+        step.body_example = Some(serde_json::json!({"title": "RESERVED"}));
+        assert_eq!(title_variants(&exp), 4);
     }
 
     #[test]
@@ -1006,16 +1159,6 @@ mod tests {
             assert_eq!(variant.expects_rejection(), rejects, "{saved}");
         }
     }
-
-    #[test]
-    fn test_json_at_path_reads_nested_fields() {
-        let body = serde_json::json!({ "title": "t", "metadata": { "source": "nadir" } });
-        assert_eq!(json_at_path(&body, "metadata.source"), Some(&Value::from("nadir")));
-        assert_eq!(json_at_path(&body, "title"), Some(&Value::from("t")));
-        assert_eq!(json_at_path(&body, "metadata.missing"), None);
-        assert_eq!(json_at_path(&body, "title.deeper"), None);
-    }
-
     #[test]
     fn test_detects_unchanged() {
         let exp = load_experiment("create-record");

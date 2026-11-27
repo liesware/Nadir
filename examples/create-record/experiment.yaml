@@ -2,6 +2,8 @@ version: 1
 
 experiment:
   name: create-record
+  # Values shown as [hidden] wherever they appear (display, records, stderr).
+  hidden: [NADIR_FIXTURE_PASSWORD]
   max_cases: 12
   exploration:
     strategy: enumerate

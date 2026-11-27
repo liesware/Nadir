@@ -3,3 +3,4 @@
 pub mod runner;
 
 pub use runner::{CaseResult, PrepareError, RunError, StepOutcome, StepResult, WorkflowRunner};
+pub mod diagnostic;

@@ -34,7 +34,7 @@ pub struct HttpObservation {
 }
 
 /// The phase at which a transport failure was observed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailurePhase {
     /// Failure occurred before any response headers were received.
@@ -47,7 +47,7 @@ pub enum FailurePhase {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportReason {
     ConnectionFailed,
@@ -292,10 +292,16 @@ fn apply_headers<B>(
     for (key, value) in headers {
         builder = builder.header(key, value);
     }
-    if let Some(ct) = content_type {
+    // Headers are appended: add the content type only when it is not set yet,
+    // or the request carries it twice.
+    if let Some(ct) = content_type.filter(|_| !has_content_type(headers)) {
         builder = builder.header("Content-Type", ct);
     }
     builder
+}
+
+pub(crate) fn has_content_type(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
 }
 
 // ── Response helpers ───────────────────────────────────────────────
@@ -362,7 +368,7 @@ fn read_body_truncated(body: ureq::Body) -> std::io::Result<(Vec<u8>, bool)> {
 // ── Loopback validation ────────────────────────────────────────────
 
 /// Validate that a URL resolves to a loopback address.
-fn validate_loopback(url: &Url) -> Result<(), TransportError> {
+pub(crate) fn validate_loopback(url: &Url) -> Result<(), TransportError> {
     let host = url
         .host_str()
         .ok_or_else(|| TransportError::NonLoopback("missing host".into()))?;

@@ -24,8 +24,56 @@ pub struct Experiment {
     pub max_cases: MaxCases,
     pub exploration: ExplorationConfig,
     pub target: Option<TargetConfig>,
-    pub adapters: AdapterConfigs,
+    pub protocols: ProtocolConfigs,
     pub steps: Vec<Step>,
+    /// Environment variables whose values are shown as `[hidden]`.
+    pub hidden: Vec<String>,
+}
+
+impl Experiment {
+    /// Every `${env.NAME}` the experiment reads (steps and target), with the
+    /// first default found for each name, in order of appearance.
+    pub fn env_references(&self) -> Vec<(String, Option<String>)> {
+        use crate::experiment::selectors::{parse_binding_value, BindingParseResult, Reference};
+        let mut found: Vec<(String, Option<String>)> = Vec::new();
+        let mut add = |reference: &Reference| {
+            if let Reference::Env { name, default } = reference {
+                if !found.iter().any(|(known, _)| known == name) {
+                    found.push((name.clone(), default.clone()));
+                }
+            }
+        };
+        for step in &self.steps {
+            for binding in &step.bindings {
+                match &binding.value {
+                    BindingValue::Reference(reference) => add(reference),
+                    BindingValue::Composite(parts) => parts.iter().for_each(|part| {
+                        if let CompositePart::Reference(reference) = part {
+                            add(reference);
+                        }
+                    }),
+                    BindingValue::Literal(_) => {}
+                }
+            }
+            if let Some(auth) = &step.auth {
+                add(&auth.bearer);
+            }
+        }
+        if let Some(target) = &self.target {
+            for text in target.command.iter().chain(target.env.values()) {
+                match parse_binding_value(&serde_json::Value::String(text.clone())) {
+                    BindingParseResult::Reference(reference) => add(&reference),
+                    BindingParseResult::Composite(parts) => parts.iter().for_each(|part| {
+                        if let CompositePart::Reference(reference) = part {
+                            add(reference);
+                        }
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
 }
 
 /// Largest accepted `max_cases`, including the baseline case.
@@ -60,6 +108,8 @@ pub enum ExplorationStrategy {
         max_execs: u32,
         duration_s: u32,
         seed: Option<u64>,
+        /// Most distinct parts one random case changes; `None` = all.
+        max_fields: Option<u16>,
     },
 }
 
@@ -95,12 +145,12 @@ pub enum CoverageTransport {
 // ── Adapters ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct AdapterConfigs {
-    pub http: Option<HttpAdapterConfig>,
+pub struct ProtocolConfigs {
+    pub http: Option<HttpProtocolConfig>,
 }
 
 #[derive(Debug, Clone)]
-pub struct HttpAdapterConfig {
+pub struct HttpProtocolConfig {
     pub base_url: String,
     pub openapi_path: String,
     pub timeout_ms: u64,
@@ -111,37 +161,97 @@ pub struct HttpAdapterConfig {
 #[derive(Debug, Clone)]
 pub struct Step {
     pub id: String,
-    pub adapter: AdapterKind,
-    pub operation_id: String,
+    pub protocol: ProtocolKind,
+    pub format: crate::formats::PayloadFormat,
+    pub operation_key: String,
+    pub body_example: Option<serde_json::Value>,
     pub bindings: Vec<Binding>,
     pub auth: Option<AuthConfig>,
     pub outputs: Vec<OutputDecl>,
     pub mutators: Vec<MutatorDecl>,
+    pub corpora: Vec<crate::mutation::text::Corpus>,
+    pub key_mutators: Vec<crate::mutation::fuzz::KeyMutator>,
     pub oracles: Vec<OracleDecl>,
-    /// Structured example cases: each replaces one body field with a
-    /// declared value and checks the exact HTTP status.
+    /// Explicit cases that check the exact HTTP status.
     pub examples: Vec<ExampleCase>,
     /// Status codes the OpenAPI operation documents, sorted; `0` is `default`.
     pub declared_statuses: Vec<u16>,
+    /// Show the request template in the run display.
+    pub print: bool,
+    /// Show each request before sending it.
+    pub debug: Option<DebugMode>,
 }
+
+/// How `debug` advances to the next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugMode {
+    /// Wait for the space key.
+    Manual,
+    /// Advance after this long, or earlier on the space key.
+    Auto(std::time::Duration),
+}
+
+/// Longest `debug.auto` interval, in seconds.
+pub const MAX_DEBUG_AUTO_S: u32 = 3600;
 
 /// A single example case declared in `cases.examples`.
 ///
-/// Each example replaces one JSON body field and asserts the exact
-/// HTTP status code. The `id` is saved alongside the case descriptor
-/// for replay.
 #[derive(Debug, Clone)]
 pub struct ExampleCase {
     pub id: String,
-    /// Dot-separated body field selector (e.g. `"title"`).
-    pub field: String,
-    pub value: serde_json::Value,
+    pub action: ExampleAction,
     pub expect_status: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdapterKind {
+impl ExampleCase {
+    pub(crate) fn json_example(&self) -> Option<&JsonExample> {
+        match &self.action {
+            ExampleAction::Json(example) => Some(example),
+            ExampleAction::Field { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExampleAction {
+    Field { path: String, value: Value },
+    Json(JsonExample),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JsonExample {
+    Rename { key: String, destination: String },
+    Syntax { fixture: JsonSyntaxFixture },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonSyntaxFixture {
+    IncompleteObject,
+    TrailingComma,
+    LeadingText,
+    TrailingText,
+}
+
+impl JsonSyntaxFixture {
+    pub(crate) fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::IncompleteObject => b"{\"sample\":",
+            Self::TrailingComma => b"{\"sample\":1,}",
+            Self::LeadingText => b"x{}",
+            Self::TrailingText => b"{}x",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtocolKind {
     Http,
+    /// HTTP/1.1 written byte for byte to a socket; the step may break it.
+    HttpRaw,
+    #[cfg(test)]
+    InMemory,
 }
 
 #[derive(Debug, Clone)]
@@ -234,10 +344,53 @@ pub enum MutatorDecl {
         /// Request-schema information per field, when the operation has one.
         field_schemas: HashMap<String, FieldSchema>,
     },
-    Headers {
-        fields: Vec<String>,
+    /// `use: http` (and its alias `use: headers`): header and path values.
+    Http {
+        fields: Vec<HttpField>,
+        mode: JsonMutatorMode,
+        /// Extra values sent after the mode's catalog, in declaration order.
         values: Vec<String>,
+        /// The OpenAPI parameter schema per field selector, when declared.
+        field_schemas: HashMap<String, FieldSchema>,
     },
+    /// `use: malform` (`protocol: http_raw` only): one case per malformation.
+    Malform {
+        malformations: Vec<crate::adapters::http_raw::Malformation>,
+    },
+}
+
+/// A request part `use: http` mutates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HttpField {
+    Header(String),
+    Path(String),
+}
+
+impl HttpField {
+    /// `header.X-Key` → `Header("X-Key")`, `path.kid` → `Path("kid")`.
+    pub fn parse(selector: &str) -> Option<Self> {
+        let (location, name) = selector.split_once('.')?;
+        if name.is_empty() {
+            return None;
+        }
+        match location {
+            "header" => Some(Self::Header(name.to_owned())),
+            "path" => Some(Self::Path(name.to_owned())),
+            _ => None,
+        }
+    }
+
+    /// The canonical selector, as in `bind`.
+    pub fn selector(&self) -> String {
+        match self {
+            Self::Header(name) => format!("header.{name}"),
+            Self::Path(name) => format!("path.{name}"),
+        }
+    }
+
+    pub fn is_header(&self) -> bool {
+        matches!(self, Self::Header(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -246,6 +399,14 @@ pub enum JsonMutatorMode {
     Unconstrained,
     /// Values derived from each field's request schema.
     Schema,
+    /// Random ASCII alphanumeric strings for input validation.
+    Alphanumeric,
+    Text(crate::mutation::text::TextGenerator),
+    /// `use: http` only: send the request without the header (or with an
+    /// empty path segment).
+    Absent,
+    /// `use: http` only: no catalog, just the mutator's `values`.
+    Values,
 }
 
 /// The JSON Schema of one request body field and whether its parent object
@@ -302,4 +463,8 @@ pub enum ExpectCondition {
     /// A number of at least 400: the request was rejected. Used by the
     /// implicit `schema:rejects-invalid` rule; not available in YAML.
     Rejected,
+    /// A malformed request was handled: answered without a 5xx, or the
+    /// connection closed, before the timeout. Used by `wire:handled`; not
+    /// available in YAML.
+    Handled,
 }

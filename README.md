@@ -43,12 +43,12 @@ flowchart TD
 
 Paso a paso:
 
-1. **Validación estática.** Se lee el YAML. Cualquier campo desconocido o mal escrito es un error. Se comprueba la versión (`1`), que los `id` de paso no se repitan, que un paso solo haga referencia a pasos *anteriores*, y que no mutes un campo que ya fijaste con `bind`.
-2. **Resolución contra OpenAPI.** Cada paso indica un `operation_id`. Nadir lo busca en el OpenAPI para saber el método, la ruta, los parámetros de ruta obligatorios, si la operación admite `bearerAuth` y el cuerpo JSON de ejemplo.
+1. **Validación estática.** Se lee el YAML. Cualquier campo desconocido o mal escrito es un error. Se comprueba la versión (`1`), que los `id` de paso no se repitan, que un paso solo haga referencia a pasos *anteriores*, y que no mutes un campo del cuerpo que ya fijaste con `bind`.
+2. **Resolución contra OpenAPI.** Cada paso indica `operation_id` u `operation_path`. Nadir resuelve el método, la ruta, los parámetros obligatorios, los esquemas de autenticación y el cuerpo JSON de ejemplo.
 
    Si el experimento tiene un bloque [`target`](#target-que-nadir-arranque-tu-servicio), Nadir arranca ahora tu servicio y espera a que responda. Si no lo tiene, el servicio debe estar ya corriendo.
 3. **Caso base (baseline).** Se ejecutan todos los pasos en orden con los valores normales. Para cada petición:
-   - el cuerpo parte del `example` del `requestBody` en el OpenAPI, y luego se aplican los valores de `bind`;
+   - el cuerpo parte de `body_example` si el paso lo declara, o del `example` del `requestBody` en el OpenAPI. Luego se aplican los valores de `bind`;
    - se resuelven las referencias `${...}`: variables de entorno, salidas de pasos anteriores (como un token) y un `${case.id}` único por caso;
    - después de recibir la respuesta se extraen los `outputs` y se evalúan los `oracles`.
 
@@ -63,7 +63,7 @@ Paso a paso:
 - Solo se hacen peticiones a direcciones **loopback**: `127.0.0.0/8` o `[::1]`. El nombre `localhost` se rechaza; usa la IP.
 - No se siguen redirecciones (se devuelve el 3xx tal cual) y no se usa ningún proxy.
 - Los cuerpos de respuesta se truncan a 256 KiB. Un cuerpo truncado produce `inconclusive` en el oráculo `openapi`.
-- Los valores de las variables de entorno y los `outputs` con `secret: true` se ocultan en los reportes y en la evidencia.
+- Solo se oculta lo que declaras: los valores de las variables listadas en [`hidden`](#hidden-qué-se-oculta) y los `outputs` con `secret: true` aparecen como `[hidden]` en pantalla, reportes y evidencia. Lo demás se muestra tal cual.
 
 ---
 
@@ -147,15 +147,17 @@ version: 1                       # obligatorio, solo existe la versión 1
 experiment:
   name: mi-experimento           # nombre libre
   max_cases: 12                  # casos totales, incluido el caso base (1–1000)
+  hidden: [API_KEY]              # opcional: variables cuyo valor sale como [hidden]
   exploration:
     strategy: enumerate          # opcional; "enumerate" (por defecto) o "fuzz", ver más abajo
+    # max_fields: 2              # solo con fuzz: como mucho N partes por caso aleatorio
 
   target:                        # opcional: Nadir arranca y para tu servicio
     command: ["./mi-servidor", "--port", "${target.port}"]
     ready:
       path: /health
 
-  adapters:
+  protocols:
     http:
       base_url: http://127.0.0.1:8080   # solo IPs loopback
       openapi: ./openapi.yaml           # ruta relativa al YAML del experimento
@@ -163,14 +165,22 @@ experiment:
 
   steps:
     - id: login                  # identificador único del paso
-      adapter: http              # siempre "http"
+      protocol: http             # http (capa de aplicación) o http_raw (capa HTTP, peticiones mal formadas)
+      format: json               # opcional; JSON es el valor predeterminado
       operation_id: login        # operationId en el OpenAPI
+      # operation_path: "/login.post"  # alternativa por plantilla y método
       bind: { ... }              # valores de entrada fijos
       auth: { ... }              # token bearer
       outputs: { ... }           # valores para pasos posteriores
       cases: { ... }             # qué variar en este paso
       oracles: [ ... ]           # qué comprobar en este paso
+      print: true                # opcional: muestra la plantilla de la petición
+      debug: true                # opcional: muestra cada petición antes de enviarla
 ```
+
+`protocol` selecciona cómo se comunica Nadir con el objetivo y `format` cómo procesa el contenido. Los nombres anteriores `adapters` y `adapter` siguen siendo válidos como alias de `protocols` y `protocol`. En cada nivel se escribe un solo nombre.
+
+Cada paso debe elegir un selector. `operation_path: "/sign/{kid}.post"` selecciona la operación `POST` de la plantilla exacta `/sign/{kid}`, aunque el OpenAPI omita `operationId`. El método admite mayúsculas y minúsculas. Los valores de parámetros como `kid` se siguen pasando con `bind`.
 
 ### `exploration`: enumeración o fuzzing
 
@@ -185,14 +195,29 @@ exploration:
 - **`enumerate`**: ejecuta el caso base, cada variante de los catálogos y los `cases.examples`, y termina.
 - **`fuzz`**: hace lo mismo y después sigue con una **fase aleatoria** hasta que se agota `duration_s` (`Stop reason: DeadlineExpired`) o `max_execs` (`MaxExecsReached`). No hace falta el bloque `target`, pero con él Nadir también detecta si el servicio se cae.
 
-**Cómo es un caso aleatorio.** Cada caso cambia de 1 a 3 campos declarados en los mutadores de **un mismo paso**. Cada valor sale de una de estas fuentes:
+**Cómo es un caso aleatorio.** Cada caso cambia partes de **un mismo paso** (una parte es un campo del cuerpo, una cabecera o un parámetro de ruta). Se arma en tres sorteos:
+
+1. **Cuántas:** un número entre 1 y el total de partes distintas del paso (o `max_fields`, si lo pones), todos con la misma probabilidad.
+2. **Cuáles:** esas partes, distintas y con la misma probabilidad cada una.
+3. **Con qué mutador:** si una parte tiene varios mutadores (por ejemplo, dos `raw` con distinto `length` sobre `X-API-Key`), se sortea uno. La parte cuenta una sola vez.
+
+Un caso de renombre de clave (`keys`) es aparte: cambia una sola clave y nada más. Con `N` partes, cada una entra en `(N+1)/(2N)` de los casos: con 3 partes, en 2 de cada 3. Si una parte bloquea a las demás (una key alterada da 401 antes de validar el resto), usa `max_fields: 1` o pon esa parte en un experimento aparte.
+
+```yaml
+exploration:
+  strategy: fuzz
+  duration_s: 60
+  max_fields: 2      # opcional: como mucho 2 partes por caso (por defecto, todas)
+```
+
+En cuanto a los valores, el modo `alphanumeric` genera cadenas ASCII alfanuméricas con longitudes variables, y los modos `alpha`, `alphanum` y `raw` con `length` generan texto de su alfabeto con la longitud de su política. En los demás modos, cada valor sale de una de estas fuentes:
 - un valor del catálogo del campo (incluidos los de `mode: schema` y tus `values`);
 - una mutación de texto del valor base o de un valor del catálogo: insertar tokens peligrosos (`'`, `%s`, `{{7*7}}`, `../../`, `\0`, `\u202e`, números límite…), borrar o duplicar trozos, repetir el texto (hasta 100 000 caracteres), truncarlo o cambiar caracteres;
 - un valor JSON extremo de cualquier tipo: enteros límite (`i64::MAX`, 2⁵³+1…), `1e308`, `5e-324`, cadenas largas, listas u objetos anidados.
 
 En las cabeceras solo se envía ASCII visible, para que la petición se pueda construir.
 
-**Reproducible.** Cada caso aleatorio depende solo de la semilla y de su número de iteración. Con la misma `seed` y el mismo experimento se repite la misma campaña (salvo dónde corte el tiempo). Un caso guardado lleva `"fuzz": {"seed": 7, "iteration": 67}`, y `nadir replay` lo regenera a partir de esos dos números.
+**Reproducible.** Cada caso aleatorio depende solo de la semilla y de su número de iteración. Con la misma `seed` y el mismo experimento se repite la misma campaña (salvo dónde corte el tiempo). Un caso guardado lleva `"fuzz": {"seed": 7, "iteration": 67}`, y `nadir replay` lo regenera a partir de esos dos números. Los casos nuevos guardan además la regla con la que se generaron (`"generator": 2`) y, si lo usaste, `max_fields`: `replay` usa esos valores aunque después cambies el experimento. Los casos guardados antes de esta regla (sin `generator`) se regeneran con la regla anterior (de 1 a 3 campos), así que se repiten igual.
 
 **Qué se guarda.** Solo los casos aleatorios que fallan alguna regla o tumban el servicio: como máximo 5 por regla y 200 por ejecución, para no llenar el disco. Los casos aleatorios sin respuesta utilizable (timeouts, conexiones cortadas) que no fallan ninguna regla solo se cuentan. `run.json` incluye un resumen en `"fuzz"` (`seed`, `executed`, `kept`, `incomplete`), y la salida muestra:
 
@@ -216,7 +241,7 @@ Se pueden usar en `bind`, `auth.bearer` y, en el caso de `${case.id}`, en `expec
 | Referencia | Valor |
 |---|---|
 | `${env.NOMBRE}` | Variable de entorno `NOMBRE`; si no está definida, la ejecución falla. Úsala para contraseñas reales y no las escribas en el YAML. |
-| `${env.NOMBRE:-valor}` | Igual, pero usa `valor` si la variable no está definida o está vacía, como en bash. Útil para credenciales de prueba y para opciones como el modo del servidor. El valor no puede contener `}`. Si se usa en `bind`, se oculta en los reportes igual que una variable de entorno. |
+| `${env.NOMBRE:-valor}` | Igual, pero usa `valor` si la variable no está definida o está vacía, como en bash. Útil para credenciales de prueba y para opciones como el modo del servidor. El valor no puede contener `}`. Si la variable está en `hidden` y se usa el valor por defecto, se oculta ese valor. |
 | `${case.id}` | UUID único de cada caso. Sirve para crear recursos que no choquen entre casos. |
 | `${steps.<id>.outputs.<nombre>}` | Salida extraída de un paso **anterior**. |
 | `${target.port}` | Puerto tomado de `base_url`. También se puede usar en `target.command` y `target.env`. |
@@ -253,7 +278,7 @@ Cómo se comporta:
 - **El servicio no arranca.** Si el proceso termina o no responde a tiempo, el error incluye las últimas 20 líneas de su stderr. No se crea carpeta de resultados.
 - **El servicio se cae durante un caso.** Se registra un hallazgo `process_exit` con el código de salida o la señal y el paso en el que ocurrió, la ejecución se detiene (`Stop reason: ProcessExit`) y se muestran las últimas líneas de su stderr. El caso se puede repetir con `nadir replay`, que arranca un servicio nuevo y sale con `1` si se vuelve a caer.
 - **Al terminar.** Nadir envía SIGTERM y, si el proceso sigue vivo a los 2 segundos, SIGKILL.
-- **Secretos.** En los extractos de stderr se ocultan las líneas que contienen valores de variables de entorno o de `target.env`.
+- **Secretos.** En los extractos de stderr, el valor de cada variable de [`hidden`](#hidden-qué-se-oculta) se reemplaza por `[hidden]`; el resto de la línea se conserva.
 - **Salida estándar.** stdout del proceso se descarta; solo se captura stderr (los últimos 64 KiB).
 
 Para que la parada funcione, `command` debe arrancar directamente el proceso que escucha en el puerto. Si necesitas una shell, usa `exec`: `["sh", "-c", "exec ./servidor --port ${target.port}"]`. Si un lanzador como `npm` crea procesos hijos, puede que estos no reciban la señal.
@@ -271,10 +296,10 @@ bind:
   header.X-Request-Source: nadir                      # cabecera
 ```
 
-- El cuerpo parte del `example` del `requestBody` en el OpenAPI, y `bind` sobrescribe o añade campos. Si un campo obligatorio no tiene ejemplo, valor por defecto ni `bind`, la resolución falla.
+- `body_example` permite declarar el cuerpo JSON inicial en el paso. Si se omite, Nadir usa el `example` del `requestBody` del OpenAPI cuando existe. Los valores de `bind` se aplican encima, y los campos que solo aparecen en el ejemplo se pueden mutar.
 - Todos los parámetros de ruta obligatorios (`{id}`) deben tener un `bind` de tipo `path.`.
 - Los valores pueden ser cadenas, números, booleanos u objetos JSON.
-- **No se puede mutar un campo que tenga `bind`.** Nadir lo rechaza para que la variante sea inequívoca. Los campos del cuerpo se comparan por segmentos: `bind: body.metadata` choca con un mutador sobre `metadata.source`, pero `body.subtitle` no choca con `title`. Las cabeceras se comparan sin distinguir mayúsculas (`header.accept-language` choca con `Accept-Language`).
+- **No se puede mutar un campo del cuerpo que tenga `bind`.** Nadir lo rechaza para que la variante sea inequívoca. Los campos se comparan por segmentos: `bind: body.metadata` choca con un mutador sobre `metadata.source`, pero `body.subtitle` no choca con `title`. Las cabeceras y los parámetros de ruta **sí** se pueden mutar aunque tengan `bind`: el caso base envía el valor del `bind` y cada caso mutado lo reemplaza (ver [`http`](#http-cabeceras-y-parámetros-de-ruta)).
 
 ### `auth`: autenticación
 
@@ -292,8 +317,27 @@ outputs:
   token:
     from: response.body.access_token   # selector de respuesta
     when_status: 200                   # opcional: solo se extrae con este status (número o lista)
-    secret: true                       # opcional: se oculta en los reportes
+    secret: true                       # opcional: su valor sale como [hidden]
 ```
+
+`secret: true` es la forma de ocultar un valor que no viene de una variable de entorno, como el token de un login. Su valor sale como `[hidden]` donde aparezca, y las respuestas de los pasos que lo usan en un `bind` no se copian a la evidencia.
+
+### `hidden`: qué se oculta
+
+Nadir solo oculta lo que declaras. `hidden` lista **variables de entorno**, y el valor de cada una se muestra como `[hidden]` donde aparezca:
+
+```yaml
+experiment:
+  hidden: [NADIR_VECTIS_API_KEY]
+```
+
+- **Por valor:** se busca el valor real en la pantalla de `debug`, las respuestas, los archivos de caso y crashes, `run.json`, la salida de `replay` y el extracto de stderr del servicio. Una key que altera el fuzzer no es ese valor, así que se ve en claro: en `debug`, el caso base muestra `X-API-Key: [hidden]` y los casos mutados muestran la key enviada.
+- **Valor por defecto:** si la variable no está definida y se usa `${env.X:-valor}`, se oculta `valor`.
+- **Validación:** cada nombre tiene que usarse en algún `${env.NOMBRE}` (`bind`, `auth`, `target.command` o `target.env`) y no puede repetirse. Así una errata no deja un secreto visible.
+- **Valores cortos:** un valor de menos de 4 caracteres da un aviso (`warning: hidden variable …`) y no se oculta, porque taparía texto por todas partes.
+- **Sin `hidden` ni `secret: true`, no se oculta nada.** Tampoco `Authorization`: si el token viene de un login, márcalo con `secret: true`; si viene de una variable, añádela a `hidden`.
+- **Un secreto escrito en el YAML** (`bind: header.X-Key: "abc123"`) no se puede ocultar. Pásalo a una variable: `"${env.X_KEY}"` y `hidden: [X_KEY]`.
+- `print` nunca muestra valores reales: las referencias salen como `{{env.X}}`.
 
 ### `cases`: qué variar
 
@@ -308,18 +352,23 @@ cases:
   mutators:
     - use: json
       fields: [title, metadata.source]   # campos del body; los anidados con puntos
-      mode: schema                       # edge_cases (por defecto) | unconstrained | schema
+      mode: schema                       # edge_cases (por defecto) | unconstrained | schema | alpha | alphanum | raw
       values: ["../../etc/passwd", 0, {"a": [1]}]   # opcional: tus propios valores, de cualquier tipo
 ```
 
 | `mode` | Valores que prueba | ¿Se puede reproducir con `replay`? |
 |---|---|---|
 | `schema` | Valores derivados del esquema de cada campo en el OpenAPI (ver la tabla siguiente). El campo tiene que existir en el esquema de la petición; si no, la validación falla. | Sí |
+| `alphanumeric` | Con `strategy: fuzz`, genera cadenas ASCII alfanuméricas de hasta 256 caracteres. Incluye la cadena vacía, longitudes alrededor de la del valor base y longitudes aleatorias. La enumeración solo usa los `values` explícitos. | Sí |
+| `alpha` / `alphanum` | Con `strategy: fuzz`, genera letras ASCII o letras y dígitos ASCII, respectivamente. Con una política de longitud, el generador elige con igual probabilidad una longitud menor o mayor que la del campo. `alphanum` equivale a `alphanumeric`. | Sí |
+| `raw` | Con `strategy: fuzz`, genera cualquier carácter: la mitad ASCII imprimible (con signos de puntuación y espacio), una quinta parte controles (`\u0000`–`\u001F` y `\u007F`, incluidos tabulador y salto de línea) y el resto Unicode que suele romper validaciones: acentos, alfabetos de derecha a izquierda, CJK, emoji fuera del BMP, caracteres combinantes, espacios de ancho cero, `\u202E`, BOM, separadores de línea, no-caracteres (`\uFFFF`, `\u{10FFFF}`). Necesita una política de longitud, igual que `alpha`. | Sí |
 | `edge_cases` (por defecto) | `""` (vacío), `"a"×200`, `"A"×200`, `"测试"` (Unicode), `"RESERVED"` | Sí |
 | `unconstrained` | `""`, `"a"×200`, `"\u0000"`, `"A"×65536`, `"</script>"`, `"' OR '1'='1"`, `"${}"`, `"null"` | Sí. Cada valor tiene un nombre estable en el caso guardado: `empty`, `long_lowercase`, `nul_byte`, `huge_uppercase`, `script_tag`, `sql_quote`, `template_syntax`, `null_string` |
 | `schema_valid` | Alias antiguo de `edge_cases`. Muestra un aviso. | Sí |
 
 Ningún modo comprueba antes de enviar si el valor cumple el esquema: los valores se envían tal cual, aunque violen `maxLength` u otras restricciones, y eso es intencional.
+
+Una política de longitud se aplica a un solo campo. `length: {reference: 64, max: 256}` genera longitudes entre 0 y 63 o entre 65 y 256. Sin `reference`, Nadir usa `minLength` y `maxLength` si el esquema declara ambos. El máximo de generación es 256 por defecto y se puede configurar hasta 4096. `alpha` y `raw` requieren una referencia o un rango del esquema. Las longitudes cuentan caracteres, no bytes: con `raw`, 64 caracteres pueden ocupar hasta 256 bytes en UTF-8. Los valores siempre son texto Unicode válido, porque viajan dentro de una cadena JSON. Para probar bytes UTF-8 inválidos o JSON mal formado, usa las pruebas de sintaxis. `alphanum` sin bloque `length` conserva la distribución de `alphanumeric`.
 
 **`values`** añade tus propios valores después del catálogo del modo, en el orden en que los escribes. Pueden ser texto, números, `null`, listas u objetos. En el caso guardado se identifican por su posición (`{"kind": "custom", "option": 0}`).
 
@@ -351,17 +400,68 @@ step probe_schema, rule schema:rejects-invalid: fail; expected rejection (status
 
 Los valores de `values` no llevan esta regla, porque Nadir no sabe si son válidos. Para ellos, escribe tus propias reglas.
 
-**`headers`**: prueba una lista de valores para una o más cabeceras.
+#### `http`: cabeceras y parámetros de ruta
+
+`use: http` muta cabeceras y parámetros de ruta igual que `use: json` muta el cuerpo. Los campos usan la misma sintaxis que `bind`:
 
 ```yaml
 cases:
   mutators:
-    - use: headers
-      fields: [Accept-Language]
-      values: ["en", "es"]
+    - use: http
+      fields: [header.X-API-Key]          # puede tener bind: el caso base usa la key válida
+      mode: raw
+      length: {reference: 64, max: 256}
+    - use: http
+      fields: [path.kid, header.X-Request-Id]
+      mode: unconstrained
+      values: ["../../etc/passwd"]
+    - use: http
+      fields: [header.X-API-Key]
+      mode: absent                        # el caso se envía sin la cabecera
 ```
 
+**Modos:** los mismos que en `json` (`edge_cases` por defecto, `unconstrained`, `schema`, `alpha`, `alphanum` y `raw` con `length`), más dos propios:
+- **`values`:** sin catálogo; solo tus `values`.
+- **`absent`:** un caso sin la cabecera (o con el segmento de ruta vacío). Sirve, por ejemplo, para comprobar que sin `X-API-Key` la API responde 401.
+
+**Con `bind`:** si el campo tiene `bind`, el caso base envía ese valor y cada caso mutado lo **reemplaza**; la cabecera nunca sale duplicada. Así se prueba "key válida en el caso base, keys alteradas en los casos mutados".
+
+| | `header.*` | `path.*` |
+|---|---|---|
+| Qué se envía | El valor tal cual. Una cabecera admite ASCII visible, espacio, tabulador y caracteres no ASCII (viajan como bytes UTF-8); no admite caracteres de control ni saltos de línea | El valor codificado como **un segmento**: `../a b` sale como `..%2Fa%20b`. Solo `A-Z a-z 0-9 - . _ ~` van sin codificar |
+| `raw` | ASCII imprimible, tabulador y Unicode, sin caracteres de control | Todo el alfabeto `raw`; se codifica al enviar |
+| `unconstrained` | Sin `nul_byte`, que no se puede enviar | Catálogo completo (`\u0000` sale como `%00`) |
+| `absent` | Quita la cabecera, aunque tenga `bind` | Segmento vacío (`/sign/`) |
+| `schema` | Casos del esquema del parámetro en el OpenAPI (`type`, `enum`, `minLength`/`maxLength`, `format`, `minimum`…). Los valores que no son texto se envían como texto (`12345`, `null`). Si el parámetro es obligatorio, incluye `missing_field` (sin la cabecera). El campo tiene que estar declarado como parámetro: `X-API-Key` suele ser un esquema de seguridad (`apiKey`), y ahí `schema` da error | Igual |
+
+- `length` necesita exactamente un campo. Sin `reference`, usa `minLength` y `maxLength` del esquema del parámetro.
+- `values` solo admite texto.
+- `print` muestra cada parte con sus modos: `X-API-Key: {{raw|absent}}`, `GET /items/{{unconstrained}}`.
+- **Límites:** no se pueden enviar `\r`, `\n` ni otros caracteres de control en una cabecera (el cliente HTTP los rechaza), así que la inyección de cabeceras (CRLF) no se puede probar. Los parámetros de query (`?a=b`) todavía no se admiten.
+
+**`headers`** es el nombre anterior y sigue funcionando: `use: headers` con `fields: [Accept-Language]` y `values: ["en", "es"]` equivale a `use: http` con `fields: [header.Accept-Language]` y `mode: values`. No admite `mode` ni `length`. Los casos guardados con `headers` se siguen repitiendo con `replay`.
+
 Cada combinación de campo y valor genera **una variante**. Con `fields: [title]` en modo `edge_cases` y una cabecera con 2 valores obtienes 7 variantes.
+
+#### Corpus de texto por líneas
+
+En `cases.mutators`, `use: file` envía cada línea tal como se leyó. `use: file_fuzz` usa cada línea como punto de partida, conserva el prefijo compatible con el alfabeto elegido y ajusta la longitud con una semilla fija.
+
+```yaml
+cases:
+  mutators:
+    - use: file_fuzz
+      fields: [title]
+      path: ./validation-corpus.txt
+      repetitions: 100
+      mode: alphanum
+      seed: 7
+      length: {reference: 64, max: 256}
+```
+
+El archivo UTF-8 se lee desde la carpeta del experimento. Admite letras, dígitos, espacios y tabulaciones. Se preservan las líneas en blanco como cadenas vacías. El archivo puede tener hasta 1 MiB y cada línea hasta 4096 caracteres. Con `file` se omiten `mode`, `seed` y `length`.
+
+Al llegar al final, Nadir vuelve a la primera línea. Cada repetición consume un caso de `max_cases`, además del caso base. Los casos de archivo se ejecutan después de los ejemplos, antes de la fase aleatoria general. `replay` verifica la huella del archivo antes de enviar el caso.
 
 #### `examples`: casos concretos con status esperado
 
@@ -376,7 +476,83 @@ cases:
       expect_status: 422        # status exacto esperado en ESTE paso
 ```
 
+#### Nombres de claves y sintaxis JSON
+
+`fields` selecciona valores y `keys` selecciona nombres de propiedades. Con `strategy: fuzz`, un mutador con `keys` y `mode: alpha`, `alphanum` o `raw` genera el nombre nuevo durante la ejecución. Cada caso de renombrado cambia una sola propiedad y conserva su valor. Los nombres generados tienen entre 4 y 24 caracteres (`length` no se aplica a los renombres) y evitan colisiones con las demás propiedades del objeto. `expect_status` añade una comprobación opcional por caso.
+
+```yaml
+cases:
+  mutators:
+    - use: json
+      keys: [message_hash.alg, message_hash.hex]
+      mode: alpha
+      expect_status: 400
+  examples:
+    - id: invalid-json
+      syntax: trailing_comma
+      expect_status: 400
+```
+
+Las pruebas de sintaxis usan documentos fijos con `syntax: incomplete_object`, `trailing_comma`, `leading_text` o `trailing_text`. Requieren una operación con cuerpo JSON y un `expect_status` de la familia `4xx`. Las pruebas de sintaxis consumen el presupuesto de `max_cases` y se pueden reproducir con `replay`.
+
+Los renombres generados consumen el presupuesto aleatorio de `max_execs` y se regeneran con la semilla y la iteración guardadas. Para regresiones explícitas, un mutador con `keys`, `rename_to` y `expect_status` sigue generando un caso enumerado por cada pareja de nombres.
+
 Los ejemplos se ejecutan después de las variantes y también consumen `max_cases`. Cada uno añade una regla implícita llamada `example:<id>`, que falla si el status no coincide.
+
+### `http_raw` y `malform`: peticiones mal formadas
+
+`protocol: http` prueba la **lógica de tu API** con peticiones HTTP bien formadas. `protocol: http_raw` prueba **la capa HTTP** (el parser del servidor, por ejemplo hyper/axum) con peticiones **mal formadas**: un `Content-Length` falso, líneas que terminan solo en `\n`, cabeceras rotas, peticiones cortadas… Se declara como un paso más, aunque use el mismo endpoint, y en cada caso los pasos se ejecutan una vez y en orden:
+
+```yaml
+steps:
+  - id: sign
+    protocol: http                     # capa de aplicación
+    operation_path: "/sign/{kid}.post"
+    # …
+  - id: axum
+    protocol: http_raw                 # capa HTTP, mismo endpoint
+    operation_path: "/sign/{kid}.post"
+    body_example: { message_hash: { alg: SHA-256, hex: "0c51…6167" } }
+    bind:
+      path.kid: fcb7…44da
+      header.X-API-Key: "${env.NADIR_VECTIS_API_KEY}"
+    cases:
+      mutators:
+        - use: malform
+          mode: catalog                # por defecto
+          # only: [short_length, length_and_chunked, bare_lf]
+    oracles:
+      - { id: base-signs, use: assert, select: response.status, expect: { equals: 200 } }
+```
+
+**Un paso `http_raw`:**
+- Usa la configuración de `protocols.http` (`base_url`, `openapi`) y arma la petición igual que `http` (`operation_*`, `bind`, `body_example`, `auth`). La escribe byte a byte en un socket TCP de loopback, con `Host`, `Content-Length` y `Connection: close`. El caso base también va por este socket, así se comprueba que el endpoint responde antes de romperlo.
+- Solo admite `use: malform`. Otro mutador, `cases.examples` u `outputs` dan error, y `malform` en un paso `http` también.
+- Después de enviar, Nadir cierra su lado de escritura. Un servidor que espera bytes que la petición prometió (un `Content-Length` largo, una línea vacía que no llega) recibe así un fin claro y puede responder o cerrar.
+
+**`mode: catalog`:** una lista fija de malformaciones con nombre. Cada una parte de la petición bien formada, cambia **una sola cosa** y genera un caso. `only` elige algunas; sin `only`, se ejecutan todas. El caso guardado lleva el nombre y `replay` reconstruye los mismos bytes. `mode: random` (corrupción aleatoria de bytes) llegará en una fase posterior.
+
+| Zona | Malformaciones |
+|---|---|
+| Línea de petición | `bad_method` (`P0ST`), `lowercase_method` (`post`), `bad_version` (`HTTP/9.9`), `missing_version`, `double_space` (`POST  /ruta`), `huge_uri` (64 KiB en la query), `nul_in_path`, `cr_in_path` |
+| Cabeceras | `crlf_injection` (un `\r` suelto dentro de un valor: `X-Nadir: nadir\rX-Injected: 1`), `bare_lf` (todas las líneas con `\n`), `header_without_colon`, `space_before_colon` (`Host : …`), `folded_header` (valor continuado en la línea siguiente), `many_headers` (10,000), `huge_header` (64 KiB), `missing_host`, `duplicate_host` |
+| Cuerpo | `short_length` (`Content-Length` de la mitad), `long_length` (+100), `negative_length` (`-1`), `non_numeric_length`, `conflicting_lengths` (dos `Content-Length` distintos), `length_and_chunked` (`Content-Length` y `Transfer-Encoding: chunked` a la vez), `bad_chunk_size`, `unterminated_chunked`, `trailing_bytes` (bytes de más después del cuerpo) |
+| Final | `no_header_terminator` (sin la línea vacía), `truncated_request` (cortada a la mitad de las cabeceras) |
+
+Las malformaciones del cuerpo usan un cuerpo de relleno si la petición no tiene uno.
+
+**`wire:handled`** es la regla implícita de cada caso mal formado. Tus oráculos del paso se evalúan solo en el caso base (en los casos mal formados quedan `skipped`):
+
+| El servidor… | Veredicto |
+|---|---|
+| responde 4xx | correcto |
+| cierra o reinicia la conexión sin responder | correcto (no marca el caso como incompleto) |
+| responde 2xx/3xx | correcto, con el status registrado: HTTP/1.1 permite tolerar algunas formas (líneas solo con `\n`, bytes de más como una segunda petición) |
+| responde 5xx | **hallazgo** `ServerError` |
+| no responde ni cierra antes de `timeout_ms` | **hallazgo** `Unresponsive` |
+| se cae | **hallazgo** `process_exit` |
+
+En la pantalla, `print` muestra la petición base y `malform: catalog, 28 cases`. `debug` muestra los bytes exactos que se enviaron: una fila por cada `\r\n`, con un `\r` o `\n` suelto y los caracteres invisibles escapados. Un crash aparece como `wire:handled · axum · length_and_chunked · HTTP 500`.
 
 ### `oracles`: qué se considera un error
 
@@ -433,6 +609,63 @@ Opciones de `expect` (usa solo una):
 
 Si `select` apunta a una respuesta que no existe (timeout o conexión cortada), el veredicto es `inconclusive`: nunca pasa ni falla por falta de datos.
 
+### `print` y `debug`: ver las peticiones
+
+Dos campos opcionales de cada paso muestran qué envía Nadir, sin frenar la ejecución: los casos corren a la velocidad normal. Las dos salidas aparecen en la pantalla de `nadir run`, entre los contadores y `Stop reason`.
+
+```yaml
+steps:
+  - id: sign
+    print: true          # muestra una vez la plantilla de la petición
+    debug: true          # muestra una petición con su respuesta; espacio pasa a la que esté en curso
+    # debug: {auto: 10}  # o cambia sola cada 10 segundos
+```
+
+**`print: true`** muestra la petición en formato HTTP. Cada parte que se muta aparece como `{{modo}}` (`{{raw}}`, `{{alphanum}}`, `{{schema}}`, `{{headers}}`, `{{file}}`…). Las referencias aparecen con su nombre (`{{env.API_KEY}}`, `{{case.id}}`, `{{steps.login.outputs.token}}`), y el largo como `{{len}}`. Debajo hay una línea por mutador y por ejemplo que explica cada marcador:
+
+```
+── print: sign ──────────────────────────────────
+POST /sign/fcb7280b…44da HTTP/1.1
+Host: 127.0.0.1:3000
+X-API-Key: {{env.NADIR_VECTIS_API_KEY}}
+Content-Type: application/json
+Content-Length: {{len}}
+
+{"message_hash":{"{{raw}}":"SHA-256","{{raw}}":"{{raw}}"}}
+  message_hash.hex: raw, length 0-63 or 65-256
+  keys message_hash.alg, message_hash.hex: raw, one rename per case, expect 400
+```
+
+La plantilla junta todas las mutaciones, pero cada caso cambia solo una parte. Por ejemplo, un renombre cambia una sola clave.
+
+**`debug`** muestra una petición real tal como se envió, con su `Content-Length` real y, debajo, **la respuesta a esa misma petición**. La pantalla se queda con esa petición mientras los casos siguen corriendo. Al presionar espacio (o cada N segundos con `auto`), cambia a la petición que esté en curso en ese momento:
+
+```
+── debug: sign · case 4512/10001 ────────────────
+POST /sign/fcb7280b…44da HTTP/1.1
+Host: 127.0.0.1:3000
+X-API-Key: [hidden]
+Content-Type: application/json
+Content-Length: 87
+
+{"message_hash":{"alg":"SHA-256","hex":"7f\u0000é<\u{202E}…"}}
+
+response: 400 {"error":"message_hash.hex must contain only hexadecimal characters"}
+[space] refresh · [q] quit          (con auto: refresh in 7 s · [space] now · [q] quit)
+```
+
+| Tecla | Qué hace |
+|---|---|
+| espacio | muestra la petición en curso y su respuesta (con `auto`, además reinicia la cuenta atrás) |
+| `q`, `Esc` o Ctrl+C | termina: la petición siguiente no se envía y la ejecución acaba con el resumen normal y `Stop reason: StoppedByUser`. Si se presiona antes de enviar el caso base, no hay nada que guardar y sale con código `2` |
+
+- **Secretos:** se muestran como `[hidden]` solo los valores declarados en [`hidden`](#hidden-qué-se-oculta) y los outputs `secret: true`.
+- **Caracteres invisibles:** los de control, los de ancho cero, los bidireccionales (`\u{202E}`), el BOM, los separadores de línea y los no-caracteres se muestran escapados como `\u{XXXX}`, pero se envían tal cual.
+- **Cuerpos largos:** se cortan en pantalla e indican cuántos bytes faltan. Si la terminal es baja, se ocultan filas; la respuesta, las teclas y la lista de crashes siempre quedan visibles.
+- **Sin terminal** (CI, `> archivo`): `print` se escribe una vez. `debug: true` escribe la primera petición con su respuesta; `debug: {auto: N}` escribe una cada N segundos.
+- **Alcance:** solo se muestran peticiones de los pasos que tienen `debug`. `nadir replay` ignora los dos campos.
+- `auto` va de 1 a 3600 segundos. `debug: false` equivale a no ponerlo.
+
 ### Selectores
 
 **Entrada** (en `bind`): `body.<a.b.c>`, `path.<nombre>`, `header.<Nombre>`.
@@ -487,7 +720,35 @@ Cada `cases/NNNN.json` contiene, por paso, el status, el resultado (`completed` 
 }
 ```
 
-**Motivos de parada** (`Stop reason`): `EnumerationComplete` (todo ejecutado), `MaxCasesReached` (se acabó `max_cases`), `DeadlineExpired` y `MaxExecsReached` (con `fuzz`: se acabó `duration_s` o `max_execs`; ninguno de los dos cuenta como error), `SetupCheckFailed` (falló una regla `setup` en el caso base), `BaselineIncomplete` (el caso base no obtuvo respuesta en algún paso) y `ProcessExit` (el servicio arrancado con `target` se cayó; queda un hallazgo con `"kind": "process_exit"`, `exit_code` y `signal` en `run.json`).
+**`Duration:`** es el tiempo de la ejecución de los casos, desde que el servicio está listo hasta que termina. Mientras corre aparece debajo de `Findings:` en segundos enteros y se actualiza con cada caso (si una petición se queda esperando su timeout, el contador avanza al terminar esa petición). Al final queda con un decimal, por ejemplo `Duration: 55.3s`.
+
+**Motivos de parada** (`Stop reason`): `EnumerationComplete` (todo ejecutado), `MaxCasesReached` (se acabó `max_cases`), `DeadlineExpired` y `MaxExecsReached` (con `fuzz`: se acabó `duration_s` o `max_execs`; ninguno de los dos cuenta como error), `SetupCheckFailed` (falló una regla `setup` en el caso base), `BaselineIncomplete` (el caso base no obtuvo respuesta en algún paso) `ProcessExit` (el servicio arrancado con `target` se cayó; queda un hallazgo con `"kind": "process_exit"`, `exit_code` y `signal` en `run.json`) y `StoppedByUser` (se presionó `q` en `debug`; no cuenta como error y lo ya ejecutado se guarda).
+
+### `artifacts/crashes/`: cada crash en cuanto ocurre
+
+Un **crash** es un caso que hace fallar un oráculo (un 500, un status no documentado, una regla tuya, `example:<id>`, `schema:rejects-invalid`…) o que tumba el servicio (`process_exit`). En el momento en que ocurre:
+
+1. `Findings:` sube en la pantalla.
+2. Nadir escribe el caso en `artifacts/crashes/DD-MM-YYYY-HHMMSS-xxxxxx.json` (hora local y 6 hex aleatorios), dentro de la **carpeta del YAML del experimento**, sin importar desde dónde se ejecute `nadir`.
+3. Debajo de `print` y `debug` aparece una línea con la regla, el paso, el status y la ruta:
+
+```
+── crashes ─────────────────────────────────────
+openapi · sign · HTTP 500 → ./artifacts/crashes/27-11-2026-184512-a3f9c1.json
+process_exit · sign → ./artifacts/crashes/27-11-2026-184530-0b7e44.json
+```
+
+- **Formato:** el archivo es un registro de caso completo, igual que `cases/NNNN.json`, con los valores declarados en `hidden` y los outputs `secret: true` como `[hidden]`. Se repite con `nadir replay experimento.yaml --case artifacts/crashes/….json`.
+- **Límites:** con `fuzz`, un mismo error puede repetirse miles de veces. Se escriben los mismos casos que se guardan en `.nadir/runs/` (hasta 5 por regla y 200 por ejecución en la fase aleatoria); las demás repeticiones solo suman en `Findings`.
+- **Pantalla:** en vivo se ven los últimos 5 crashes; al final, hasta 20. Sin terminal, cada crash se escribe en una línea `crash: …` en cuanto ocurre.
+- **Errores:** si el archivo no se puede escribir (permisos, disco lleno), la línea dice `crash file not written: …` y la ejecución sigue.
+- **Git:** `.gitignore` ya ignora `**/artifacts/crashes/`.
+
+### Diagnósticos fuera de los oráculos
+
+Una salida confirmada del objetivo genera un YAML de solo lectura en `artifacts/crashes/`. Los errores de transporte se guardan en `artifacts/transport-errors/`. El YAML comparte nombre base y `case_id` con su registro JSON de diagnóstico. Incluye el paso, el método, la plantilla de ruta y los metadatos disponibles del cuerpo. Omite valores de encabezados, rutas resueltas y contenido del cuerpo.
+
+Nadir guarda las salidas confirmadas como `process_exit`. Si el proceso sigue activo o no se puede confirmar su salida, el evento se registra como `transport_error`. Nadir guarda la primera captura por paso, motivo y fase de transporte por ejecución. La consola muestra estos eventos en `transport errors`. `Transport errors` cuenta todas las ocurrencias por separado de `Findings`. Un cierre antes de los encabezados que el propio caso acepta permanece en el registro del caso, fuera del contador y de las alertas de transporte. Una salida confirmada conserva su diagnóstico.
 
 **`nadir replay`** vuelve a ejecutar la variante guardada contra el servicio *actual*:
 
@@ -550,8 +811,9 @@ src/
 ├── config/         tipos YAML crudos, validación estática, carga + huellas SHA-256
 ├── experiment/     resolución contra OpenAPI, selectores y referencias ${...}
 ├── adapters/http/  contrato OpenAPI, construcción de peticiones, transporte loopback
+├── adapters/http_raw/ peticiones byte a byte por socket TCP, catálogo `malform`, lector de respuestas tolerante
 ├── execution/      WorkflowRunner: ejecuta los pasos, resuelve referencias, extrae outputs
-├── mutation/       VariantGenerator: catálogos edge_cases / unconstrained / schema / headers; fuzz.rs: casos aleatorios por semilla
+├── mutation/       VariantGenerator: catálogos edge_cases / unconstrained / schema / http (cabeceras y ruta); fuzz.rs: casos aleatorios por semilla
 ├── exploration/    enumeración, fase aleatoria (fuzz.rs) y presupuesto (libafl/: base del futuro fuzzing con cobertura)
 ├── evaluation/     oráculos (openapi, openapi_schema, assert, record_absent)
 ├── finding/        agrupación (deduplicación) de hallazgos

@@ -2,27 +2,28 @@
 //!
 //! # Design notes
 //!
-//! **Chosen:** `WorkflowRunner` holds shared run-scope resources (HTTP client,
+//! **Chosen:** `WorkflowRunner` holds shared run-scope resources (protocols and
 //! process monitor). Each case execution creates a fresh
 //! `CaseContext` with its own case_id and scratch storage. Step outputs from
 //! one case never leak into another.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::Value;
-use url::Url;
 use uuid::Uuid;
 
-use crate::adapters::http::contract::{ResolvedContract, ResolvedOperation};
-use crate::adapters::http::request;
-use crate::adapters::http::transport::{
-    FailurePhase, HttpClient, HttpObservation, TransportError, TransportReason,
-};
+use crate::adapters::http::contract::ResolvedContract;
+use crate::adapters::http::execution::HttpStepProtocol;
+use crate::adapters::http::transport::{FailurePhase, TransportReason};
+use crate::adapters::{AdapterExecution, Inspection, StepProtocol, StepInput};
+use crate::inspect::{RequestInspector, RequestTemplate};
 use crate::evaluation::schema_validator::SchemaValidatorCache;
 use crate::experiment::selectors::Reference;
-use crate::experiment::types::{Binding, BindingValue, CompositePart, Experiment, Step};
+use crate::experiment::types::{
+    ProtocolKind, Binding, BindingValue, CompositePart, ExampleAction, ExampleCase, Experiment, JsonExample, ReplacementValue, Step,
+};
+use crate::observation::StepObservation;
 use crate::target::ProcessMonitor;
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -58,7 +59,8 @@ pub struct CaseResult {
 pub struct StepResult {
     pub step_id: String,
     pub outcome: StepOutcome,
-    pub observation: Option<HttpObservation>,
+    pub observation: Option<StepObservation>,
+    pub request_diagnostic: Option<crate::execution::diagnostic::RequestDiagnostic>,
     pub extracted_outputs: HashMap<String, Value>,
     /// Suppress response data in evidence when a binding was derived from a secret.
     pub sensitive_response: bool,
@@ -89,13 +91,16 @@ pub enum StepOutcome {
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     #[error("transport error: {0}")]
-    Transport(#[from] TransportError),
+    Transport(#[from] crate::adapters::http::transport::TransportError),
     #[error("input build error: {0}")]
-    InputBuild(#[from] request::InputBuildError),
+    InputBuild(#[from] crate::adapters::http::request::InputBuildError),
     #[error("missing contract for adapter")]
     MissingContract,
     #[error("infrastructure error: {0}")]
     Infrastructure(String),
+    /// The user stopped the run from the `debug` display.
+    #[error("stopped by the user")]
+    StoppedByUser,
 }
 
 // ── WorkflowRunner ─────────────────────────────────────────────────
@@ -103,12 +108,15 @@ pub enum RunError {
 /// A workflow runner has already resolved its runtime configuration before contacting the target.
 pub struct WorkflowRunner {
     experiment: Arc<Experiment>,
-    contracts: Arc<HashMap<String, ResolvedContract>>,
-    http: HttpClient,
+    protocols: HashMap<ProtocolKind, Box<dyn StepProtocol>>,
     runtime: RuntimeInputs,
-    diagnostic_secrets: Vec<String>,
+    /// Values of the `hidden` variables, shown as `[hidden]`.
+    hidden_values: Vec<String>,
+    /// `hidden` variables too short to hide.
+    short_hidden: Vec<String>,
     monitor: Option<Box<dyn ProcessMonitor>>,
     pub(crate) schema_cache: Arc<SchemaValidatorCache>,
+    inspector: Option<Box<dyn RequestInspector>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,12 +125,12 @@ pub enum PrepareError {
     Schema(#[from] crate::evaluation::schema_validator::SchemaPreparationError),
     #[error("target.coverage is unavailable in this release")]
     CoverageUnavailable,
-    #[error("an HTTP adapter is required")]
-    NoHttpAdapter,
+    #[error("an HTTP protocol configuration is required")]
+    NoHttpProtocol,
     #[error("invalid HTTP base URL")]
     InvalidBaseUrl,
     #[error("HTTP client requires a valid loopback base URL")]
-    HttpClient(#[source] TransportError),
+    HttpClient(#[source] crate::adapters::http::transport::TransportError),
     #[error(
         "step '{step_id}': missing or invalid environment variable '{name}' \
          (set it, for example `export {name}=...`, or give a default with ${{env.{name}:-value}})"
@@ -158,22 +166,28 @@ impl WorkflowRunner {
         contracts: Arc<HashMap<String, ResolvedContract>>,
         schema_cache: Arc<SchemaValidatorCache>,
     ) -> Result<Self, PrepareError> {
-        if experiment
-            .target
-            .as_ref()
-            .is_some_and(|target| target.coverage.is_some())
-        {
+        if experiment.target.as_ref().is_some_and(|target| target.coverage.is_some()) {
             return Err(PrepareError::CoverageUnavailable);
         }
-        let adapter = experiment
-            .adapters
-            .http
-            .as_ref()
-            .ok_or(PrepareError::NoHttpAdapter)?;
-        let base_url = Url::parse(&adapter.base_url).map_err(|_| PrepareError::InvalidBaseUrl)?;
+        let http = HttpStepProtocol::prepare(&experiment, contracts.clone())?;
+        let target_port = http.target_port();
+        let raw = crate::adapters::http_raw::HttpRawStepProtocol::prepare(&experiment, contracts)?;
+        let protocols = HashMap::from([
+            (ProtocolKind::Http, Box::new(http) as Box<dyn StepProtocol>),
+            (ProtocolKind::HttpRaw, Box::new(raw) as Box<dyn StepProtocol>),
+        ]);
+        Self::with_protocols(experiment, protocols, target_port, schema_cache)
+    }
+
+    fn with_protocols(
+        experiment: Arc<Experiment>,
+        protocols: HashMap<ProtocolKind, Box<dyn StepProtocol>>,
+        target_port: Option<u16>,
+        schema_cache: Arc<SchemaValidatorCache>,
+    ) -> Result<Self, PrepareError> {
         let environment: HashMap<_, _> = std::env::vars_os().collect();
         let runtime =
-            RuntimeInputs::prepare(&experiment, base_url.port_or_known_default(), |name| {
+            RuntimeInputs::prepare(&experiment, target_port, |name| {
                 let value = environment
                     .get(std::ffi::OsStr::new(name))
                     .ok_or(std::env::VarError::NotPresent)?;
@@ -182,29 +196,63 @@ impl WorkflowRunner {
                     .map(str::to_owned)
                     .ok_or_else(|| std::env::VarError::NotUnicode(value.clone()))
             })?;
-        // Preserve environment-value redaction even for values echoed by the service.
-        // Defaults used in place of unset variables are redacted the same way.
-        let diagnostic_secrets = environment
-            .into_values()
-            .filter_map(|value| value.into_string().ok())
-            .chain(runtime.environment.values().cloned())
-            .filter(|value| !value.is_empty())
-            .collect();
-        let http = HttpClient::new(base_url, Duration::from_millis(adapter.timeout_ms))
-            .map_err(PrepareError::HttpClient)?;
+        // Only the variables listed in `hidden` are hidden, by their effective
+        // value: the one a step read, or for target-only variables the
+        // environment value or the reference's default.
+        let references = experiment.env_references();
+        let (mut hidden_values, mut short_hidden) = (Vec::new(), Vec::new());
+        for name in &experiment.hidden {
+            let value = runtime.environment.get(name).cloned().or_else(|| {
+                let set = environment
+                    .get(std::ffi::OsStr::new(name))
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                set.or_else(|| references.iter().find(|(known, _)| known == name)?.1.clone())
+            });
+            match value {
+                Some(value) if value.chars().count() >= crate::inspect::MIN_HIDDEN_LEN => hidden_values.push(value),
+                _ => short_hidden.push(name.clone()),
+            }
+        }
+        for step in &experiment.steps {
+            if let Some(Reference::Env { name, .. }) = step.auth.as_ref().map(|auth| &auth.bearer) {
+                if !protocols.get(&step.protocol).is_some_and(|adapter| {
+                    runtime.environment.get(name).is_some_and(|value| adapter.accepts_authorization(value))
+                }) {
+                    return Err(PrepareError::Environment { step_id: step.id.clone(), name: name.clone() });
+                }
+            }
+        }
         Ok(Self {
             experiment,
-            contracts,
-            http,
+            protocols,
             runtime,
-            diagnostic_secrets,
+            hidden_values,
+            short_hidden,
             monitor: None,
             schema_cache,
+            inspector: None,
         })
     }
 
     pub fn experiment(&self) -> &Experiment {
         &self.experiment
+    }
+
+    /// Install the hook called around each request of a step with `debug`.
+    pub fn set_inspector(&mut self, inspector: Option<Box<dyn RequestInspector>>) {
+        self.inspector = inspector;
+    }
+
+    /// Request templates of the steps with `print`, in step order.
+    pub fn request_templates(&self) -> Vec<RequestTemplate> {
+        self.experiment
+            .steps
+            .iter()
+            .filter(|step| step.print)
+            .filter_map(|step| self.protocols.get(&step.protocol)?.request_template(step))
+            .collect()
     }
 
     pub fn set_monitor(&mut self, monitor: Option<Box<dyn ProcessMonitor>>) {
@@ -215,29 +263,54 @@ impl WorkflowRunner {
         self.monitor.as_mut().map(|monitor| monitor.status())
     }
 
-    pub(crate) fn http_contract(&self) -> Option<&ResolvedContract> {
-        self.experiment
-            .adapters
-            .http
-            .as_ref()
-            .and_then(|adapter| self.contracts.get(&adapter.openapi_path))
+    pub(crate) fn baseline_value(&self, step: &Step, selector: &str) -> Option<ReplacementValue> {
+        self.protocols.get(&step.protocol)?.baseline_value(step, selector)
     }
 
-    pub(crate) fn diagnostic_secrets(&self) -> &[String] {
-        &self.diagnostic_secrets
+    pub(crate) fn accepts_variant(&self, step: &Step, selector: &str, value: &ReplacementValue) -> bool {
+        self.protocols
+            .get(&step.protocol)
+            .is_some_and(|adapter| adapter.accepts_variant(step, selector, value))
+    }
+
+    pub(crate) fn contract_fingerprint(&self, step_id: &str) -> Option<[u8; 32]> {
+        let step = self.experiment.steps.iter().find(|step| step.id == step_id)?;
+        self.protocols.get(&step.protocol)?.contract_fingerprint()
+    }
+
+    /// Distinct operations the experiment calls (an `http` and an
+    /// `http_raw` step on the same operation count once).
+    pub(crate) fn endpoint_count(&self) -> usize {
+        self.experiment
+            .steps
+            .iter()
+            .filter(|step| self.protocols.contains_key(&step.protocol))
+            .map(|step| step.operation_key.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// Values shown as `[hidden]` in the display, records and reports.
+    pub(crate) fn hidden_values(&self) -> &[String] {
+        &self.hidden_values
+    }
+
+    /// `hidden` variables whose value is too short (or empty) to hide.
+    pub(crate) fn short_hidden(&self) -> &[String] {
+        &self.short_hidden
     }
 
     /// Execute the baseline case (no mutations applied).
     pub fn execute_baseline(&mut self) -> Result<CaseResult, RunError> {
-        self.execute_with_scope(&[], None)
+        self.execute_with_scope(&[], None, None, None)
     }
 
     /// Execute a case with a set of replacements.
     pub fn execute_case(
         &mut self,
-        plan: &[(String, request::ReplacementValue)],
+        plan: &[(String, ReplacementValue)],
     ) -> Result<CaseResult, RunError> {
-        self.execute_with_scope(plan, None)
+        self.execute_with_scope(plan, None, None, None)
     }
 
     /// Execute a case that replaces several fields of one step.
@@ -246,7 +319,7 @@ impl WorkflowRunner {
         step_id: &str,
         replacements: &[(String, crate::experiment::types::ReplacementValue)],
     ) -> Result<CaseResult, RunError> {
-        self.execute_with_scope(replacements, Some(step_id))
+        self.execute_with_scope(replacements, Some(step_id), None, None)
     }
 
     pub(crate) fn execute_variant(
@@ -255,20 +328,55 @@ impl WorkflowRunner {
         selector: &str,
         value: crate::experiment::types::ReplacementValue,
     ) -> Result<CaseResult, RunError> {
-        self.execute_with_scope(&[(selector.to_owned(), value)], Some(step_id))
+        self.execute_with_scope(&[(selector.to_owned(), value)], Some(step_id), None, None)
+    }
+
+    pub(crate) fn execute_fuzz_case(
+        &mut self,
+        case: &crate::mutation::fuzz::FuzzCase,
+    ) -> Result<CaseResult, RunError> {
+        if let Some(rename) = &case.key_rename {
+            self.execute_with_scope(&[], Some(&case.step_id), Some(&rename.action), None)
+        } else {
+            self.execute_replacements(&case.step_id, &case.replacements)
+        }
+    }
+
+    pub(crate) fn execute_example(
+        &mut self,
+        step_id: &str,
+        example: &ExampleCase,
+    ) -> Result<CaseResult, RunError> {
+        match &example.action {
+            ExampleAction::Field { path, value } => self.execute_variant(
+                step_id, &format!("body.{path}"), ReplacementValue::JsonValue(value.clone()),
+            ),
+            ExampleAction::Json(action) => self.execute_with_scope(&[], Some(step_id), Some(action), None),
+        }
+    }
+
+    /// Execute a case that breaks one `http_raw` step's request.
+    pub(crate) fn execute_malform(
+        &mut self,
+        step_id: &str,
+        malformation: crate::adapters::http_raw::Malformation,
+    ) -> Result<CaseResult, RunError> {
+        self.execute_with_scope(&[], Some(step_id), None, Some(malformation))
     }
 
     fn execute_with_scope(
         &mut self,
-        replacements: &[(String, request::ReplacementValue)],
+        replacements: &[(String, ReplacementValue)],
         step_id: Option<&str>,
+        json_example: Option<&JsonExample>,
+        malformation: Option<crate::adapters::http_raw::Malformation>,
     ) -> Result<CaseResult, RunError> {
         let ctx = CaseContext {
             case_id: Uuid::new_v4().to_string(),
             runtime: &self.runtime,
         };
         let variant_step = step_id;
-        let requests_before = self.http.requests_sent();
+        let mut requests_sent = 0u32;
         let mut step_results = Vec::new();
         let mut step_outputs = StepOutputs::new();
 
@@ -279,45 +387,48 @@ impl WorkflowRunner {
                     step_id: step.id.clone(),
                     outcome: StepOutcome::Skipped { reason },
                     observation: None,
+                    request_diagnostic: None,
                     extracted_outputs: HashMap::new(),
                     sensitive_response: false,
                 });
                 continue;
             }
 
-            // Get the operation from the contract
-            let operation = self
-                .http_contract()
-                .and_then(|contract| contract.operations.get(&step.operation_id))
-                .ok_or(RunError::MissingContract)?;
-
-            // Build and execute the request
-            let step_replacements = if variant_step.is_none_or(|id| id == step.id) {
-                replacements
-            } else {
-                &[]
+            let adapter = self.protocols.get_mut(&step.protocol).ok_or_else(|| {
+                RunError::Infrastructure(format!("adapter unavailable for step '{}'", step.id))
+            })?;
+            let selected = variant_step.is_none_or(|id| id == step.id);
+            let step_replacements = if selected { replacements } else { &[] };
+            let step_example = if selected { json_example } else { None };
+            let step_malformation = if selected { malformation } else { None };
+            let inspection = match (&step.debug, self.inspector.as_deref_mut()) {
+                (Some(_), Some(inspector)) => Some(Inspection {
+                    inspector,
+                    secrets: inspection_secrets(&self.hidden_values, &step_outputs),
+                }),
+                _ => None,
             };
-            let result = execute_step(
-                step,
-                operation,
-                &self.http,
-                &ctx,
-                step_replacements,
-                &step_outputs,
-            );
-
-            match result {
-                Ok(completed) => {
+            let changes = StepChanges {
+                replacements: step_replacements,
+                json_example: step_example,
+                malformation: step_malformation,
+            };
+            let execution = execute_step(step, adapter.as_mut(), &ctx, changes, &step_outputs, inspection)?;
+            requests_sent = requests_sent.wrapping_add(execution.requests_sent);
+            match execution.result {
+                Ok(observation) => {
+                    let outputs = extract_step_outputs(step, &observation);
+                    let sensitive_response = uses_sensitive_binding(step, &step_outputs);
                     let published = step
                         .outputs
                         .iter()
                         .filter_map(|declaration| {
-                            let value = completed.outputs.get(&declaration.name)?.clone();
+                            let value = outputs.get(&declaration.name)?.clone();
                             Some((
                                 declaration.name.clone(),
                                 PublishedOutput {
                                     value,
-                                    sensitive: declaration.secret || completed.sensitive_response,
+                                    sensitive: declaration.secret || sensitive_response,
                                 },
                             ))
                         })
@@ -326,33 +437,18 @@ impl WorkflowRunner {
                     step_results.push(StepResult {
                         step_id: step.id.clone(),
                         outcome: StepOutcome::Completed,
-                        observation: Some(completed.observation),
-                        extracted_outputs: completed.outputs,
-                        sensitive_response: completed.sensitive_response,
+                        observation: Some(observation),
+                        request_diagnostic: execution.request_diagnostic,
+                        extracted_outputs: outputs,
+                        sensitive_response,
                     });
                 }
-                Err(StepError::Transport(e)) => {
-                    let transport_reason = Some(e.reason());
-                    let transport_phase = e.phase();
+                Err(outcome) => {
                     step_results.push(StepResult {
                         step_id: step.id.clone(),
-                        outcome: StepOutcome::TransportError {
-                            error: e.to_string(),
-                            transport_reason,
-                            transport_phase,
-                        },
+                        outcome,
                         observation: None,
-                        extracted_outputs: HashMap::new(),
-                        sensitive_response: false,
-                    });
-                }
-                Err(StepError::InputBuild(e)) => {
-                    step_results.push(StepResult {
-                        step_id: step.id.clone(),
-                        outcome: StepOutcome::InputError {
-                            error: e.to_string(),
-                        },
-                        observation: None,
+                        request_diagnostic: execution.request_diagnostic,
                         extracted_outputs: HashMap::new(),
                         sensitive_response: false,
                     });
@@ -364,39 +460,23 @@ impl WorkflowRunner {
             case_id: ctx.case_id,
             step_results,
             was_executed: true,
-            requests_sent: self.http.requests_sent().wrapping_sub(requests_before),
+            requests_sent,
         })
     }
 }
 
 // ── Step execution ─────────────────────────────────────────────────
 
-enum StepError {
-    Transport(TransportError),
-    InputBuild(request::InputBuildError),
-}
-
-struct CompletedStep {
-    observation: HttpObservation,
-    outputs: HashMap<String, Value>,
-    sensitive_response: bool,
-}
-
-fn execute_step(
-    step: &Step,
-    operation: &ResolvedOperation,
-    http: &HttpClient,
-    ctx: &CaseContext<'_>,
-    replacements: &[(String, request::ReplacementValue)],
-    step_outputs: &StepOutputs,
-) -> Result<CompletedStep, StepError> {
+/// Whether a step's request carries a secret output (`secret: true`, or
+/// one derived from it), so its response data is kept out of evidence.
+/// Environment values are hidden by value only, through `hidden`.
+fn uses_sensitive_binding(step: &Step, step_outputs: &StepOutputs) -> bool {
     // Bearer authentication uses its own channel. Ordinary bindings can embed secret data in the request.
-    let sensitive_response = step
+    step
         .bindings
         .iter()
         .flat_map(|binding| extract_references(&binding.value))
         .any(|reference| match reference {
-            Reference::Env { .. } => true,
             Reference::StepOutput {
                 step_id,
                 output_name,
@@ -405,40 +485,53 @@ fn execute_step(
                 .and_then(|outputs| outputs.get(&output_name))
                 .is_some_and(|output| output.sensitive),
             _ => false,
-        });
-    let mut resolved_bindings = resolve_runtime_bindings(&step.bindings, ctx, step_outputs)
-        .map_err(StepError::InputBuild)?;
-    if let Some(auth) = &step.auth {
-        let token =
-            resolve_reference(&auth.bearer, ctx, step_outputs).map_err(StepError::InputBuild)?;
-        let token = token
-            .as_str()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| {
-                StepError::InputBuild(request::InputBuildError::UnresolvedRequiredField {
-                    field: "bearer token".into(),
-                })
-            })?;
-        resolved_bindings.push(Binding {
-            selector: crate::experiment::selectors::InputSelector::HeaderParam(
-                "Authorization".into(),
-            ),
-            value: BindingValue::Literal(Value::String(format!("Bearer {token}"))),
-        });
-    }
+        })
+}
 
-    let input =
-        request::build_step_request(operation, &resolved_bindings, replacements, http.base_url())
-            .map_err(StepError::InputBuild)?;
-    let observation = http.execute(&input).map_err(StepError::Transport)?;
+/// Values `debug` redacts: the environment variables the experiment reads
+/// that `hidden` lists and the secret outputs published so far.
+fn inspection_secrets(hidden: &[String], step_outputs: &StepOutputs) -> Vec<String> {
+    let outputs = step_outputs
+        .values()
+        .flat_map(HashMap::values)
+        .filter(|output| output.sensitive)
+        .map(|output| output.value.as_str().map_or_else(|| output.value.to_string(), str::to_owned));
+    hidden.iter().cloned().chain(outputs).collect()
+}
 
-    // Extract outputs
-    let extracted = extract_step_outputs(step, &observation);
+/// What a case changes in the step it targets.
+struct StepChanges<'a> {
+    replacements: &'a [(String, ReplacementValue)],
+    json_example: Option<&'a JsonExample>,
+    malformation: Option<crate::adapters::http_raw::Malformation>,
+}
 
-    Ok(CompletedStep {
-        observation,
-        outputs: extracted,
-        sensitive_response,
+fn execute_step(
+    step: &Step,
+    adapter: &mut dyn StepProtocol,
+    ctx: &CaseContext<'_>,
+    changes: StepChanges<'_>,
+    step_outputs: &StepOutputs,
+    inspection: Option<Inspection<'_>>,
+) -> Result<AdapterExecution, RunError> {
+    let bindings = match resolve_runtime_bindings(&step.bindings, ctx, step_outputs) {
+        Ok(bindings) => bindings,
+        Err(error) => return Ok(AdapterExecution::input_error(error)),
+    };
+    let authorization = step.auth.as_ref()
+        .map(|auth| resolve_reference(&auth.bearer, ctx, step_outputs))
+        .transpose();
+    let authorization = match authorization {
+        Ok(value) => value,
+        Err(error) => return Ok(AdapterExecution::input_error(error)),
+    };
+    adapter.execute(step, StepInput {
+        bindings: &bindings,
+        authorization,
+        replacements: changes.replacements,
+        json_example: changes.json_example,
+        inspection,
+        malformation: changes.malformation,
     })
 }
 
@@ -447,7 +540,7 @@ fn resolve_runtime_bindings(
     bindings: &[Binding],
     ctx: &CaseContext<'_>,
     step_outputs: &StepOutputs,
-) -> Result<Vec<Binding>, request::InputBuildError> {
+) -> Result<Vec<Binding>, String> {
     bindings
         .iter()
         .map(|binding| {
@@ -485,7 +578,7 @@ fn resolve_reference(
     reference: &Reference,
     ctx: &CaseContext<'_>,
     step_outputs: &StepOutputs,
-) -> Result<Value, request::InputBuildError> {
+) -> Result<Value, String> {
     let resolved = match reference {
         Reference::Env { name, .. } => ctx
             .runtime
@@ -506,9 +599,7 @@ fn resolve_reference(
             .target_port
             .map(|port| Value::String(port.to_string())),
     };
-    resolved.ok_or_else(|| request::InputBuildError::UnresolvedRequiredField {
-        field: reference.to_string(),
-    })
+    resolved.ok_or_else(|| format!("required field '{reference}' has no example, default, or binding"))
 }
 
 /// Check if a step's dependencies (outputs from earlier steps) are satisfied.
@@ -608,17 +699,7 @@ impl RuntimeInputs {
                     _ => {}
                 }
             }
-            if let Some(Reference::Env { name, .. }) = step.auth.as_ref().map(|auth| &auth.bearer) {
-                if environment.get(name).is_none_or(|value| {
-                    value.is_empty()
-                        || http::HeaderValue::from_str(&format!("Bearer {value}")).is_err()
-                }) {
-                    return Err(PrepareError::Environment {
-                        step_id: step.id.clone(),
-                        name: name.clone(),
-                    });
-                }
-            }
+
         }
         Ok(Self {
             environment,
@@ -627,20 +708,20 @@ impl RuntimeInputs {
     }
 }
 
-/// Extract declared outputs from an HTTP observation.
-fn extract_step_outputs(step: &Step, observation: &HttpObservation) -> HashMap<String, Value> {
+/// Extract declared outputs from the adapter observation.
+fn extract_step_outputs(step: &Step, observation: &StepObservation) -> HashMap<String, Value> {
     let mut outputs = HashMap::new();
 
     for output_decl in &step.outputs {
         // Check when_status
         if let Some(ref statuses) = output_decl.when_status {
-            if !statuses.contains(&observation.status) {
+            if !observation.http_status().is_some_and(|status| statuses.contains(&status)) {
                 continue; // status doesn't match — output is absent (not an error)
             }
         }
 
         if let crate::observation::SelectedValue::Present(value) =
-            crate::observation::select_response(&output_decl.from, observation)
+            observation.select(&output_decl.from)
         {
             outputs.insert(output_decl.name.clone(), value);
         }
@@ -651,8 +732,145 @@ fn extract_step_outputs(step: &Step, observation: &HttpObservation) -> HashMap<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::http::transport::HttpObservation;
     use crate::experiment::selectors::ObservationSelector;
     use crate::observation::{select_response, ObservationError, SelectedValue};
+
+    #[test]
+    fn runs_a_workflow_with_a_non_http_adapter() {
+        use crate::evaluation::Verdict;
+        use crate::experiment::selectors::{InputSelector, JsonPathSegment};
+        use crate::experiment::types::{
+            ProtocolConfigs, ExpectCondition, ExplorationConfig, ExplorationStrategy, JsonMutatorMode,
+            MaxCases, MutatorDecl, OracleDecl, OracleType, OutputDecl,
+        };
+        use crate::exploration::{run_enumeration, RunBudget};
+        use serde_json::json;
+
+        struct InMemory;
+
+        impl StepProtocol for InMemory {
+            fn execute(&mut self, step: &Step, input: StepInput<'_>) -> Result<AdapterExecution, RunError> {
+                let result = if step.id == "source" {
+                    assert!(input.replacements.is_empty());
+                    json!({"value": "published"})
+                } else {
+                    let [binding] = input.bindings else {
+                        panic!("expected one resolved binding");
+                    };
+                    let BindingValue::Literal(value) = &binding.value else {
+                        panic!("expected a literal binding");
+                    };
+                    let variant = match input.replacements {
+                        [] => "original",
+                        [(selector, ReplacementValue::JsonString(value))] => {
+                            assert_eq!(selector, "body.variant");
+                            value
+                        }
+                        _ => panic!("expected one string replacement"),
+                    };
+                    json!({"value": value, "variant": variant})
+                };
+                Ok(AdapterExecution {
+                    result: Ok(StepObservation::InMemory(result)),
+                    requests_sent: 0,
+                    request_diagnostic: None,
+                })
+            }
+
+            fn accepts_authorization(&self, _: &str) -> bool { false }
+
+            fn baseline_value(&self, _: &Step, selector: &str) -> Option<ReplacementValue> {
+                assert_eq!(selector, "body.variant");
+                Some(ReplacementValue::JsonString("original".into()))
+            }
+
+            fn accepts_variant(&self, _: &Step, _: &str, _: &ReplacementValue) -> bool { false }
+            fn contract_fingerprint(&self) -> Option<[u8; 32]> { None }
+        }
+
+        let body_value = ObservationSelector::Body(vec![JsonPathSegment::Key("value".into())]);
+        let body_variant = ObservationSelector::Body(vec![JsonPathSegment::Key("variant".into())]);
+        let source = Step {
+            id: "source".into(),
+            protocol: ProtocolKind::InMemory,
+            format: crate::formats::PayloadFormat::Json,
+            operation_key: "publish".into(),
+            body_example: None,
+            bindings: Vec::new(),
+            auth: None,
+            outputs: vec![OutputDecl {
+                name: "value".into(),
+                from: body_value.clone(),
+                when_status: None,
+                secret: true,
+            }],
+            mutators: Vec::new(),
+            corpora: Vec::new(),
+            key_mutators: Vec::new(),
+            print: false,
+            debug: None,
+            oracles: Vec::new(),
+            examples: Vec::new(),
+            declared_statuses: Vec::new(),
+        };
+        let sink = Step {
+            id: "sink".into(),
+            operation_key: "consume".into(),
+            bindings: vec![Binding {
+                selector: InputSelector::BodyField(vec!["value".into()]),
+                value: BindingValue::Reference(Reference::StepOutput {
+                    step_id: "source".into(),
+                    output_name: "value".into(),
+                }),
+            }],
+            outputs: vec![OutputDecl {
+                name: "variant".into(),
+                from: body_variant,
+                when_status: None,
+                secret: false,
+            }],
+            oracles: vec![OracleDecl {
+                id: "received-published-value".into(),
+                oracle_type: OracleType::Assert,
+                kind: None,
+                setup: true,
+                select: Some(body_value),
+                when_condition: None,
+                expect: Some(ExpectCondition::Equals(json!("published"))),
+                record_reference: None,
+            }],
+            mutators: vec![MutatorDecl::Json {
+                fields: Some(vec!["variant".into()]),
+                mode: JsonMutatorMode::Alphanumeric,
+                values: vec![json!("original"), json!("changed")],
+                field_schemas: HashMap::new(),
+            }],
+            ..source.clone()
+        };
+        let experiment = Arc::new(Experiment {
+            name: "in-memory-workflow".into(),
+            max_cases: MaxCases::new(2),
+            exploration: ExplorationConfig { strategy: ExplorationStrategy::Enumerate },
+            target: None,
+            protocols: ProtocolConfigs { http: None },
+            steps: vec![source, sink],
+            hidden: Vec::new(),
+        });
+        let protocols = HashMap::from([(ProtocolKind::InMemory, Box::new(InMemory) as Box<dyn StepProtocol>)]);
+        let mut runner = WorkflowRunner::with_protocols(
+            experiment.clone(), protocols, None, Arc::new(SchemaValidatorCache::new()),
+        ).unwrap();
+        let run = run_enumeration(&mut runner, &experiment, &mut RunBudget::new(2, None, None)).unwrap();
+        assert_eq!(run.cases.len(), 1);
+        for (result, variant) in [(&run.baseline_case, "original"), (&run.cases[0], "changed")] {
+            assert_eq!(result.checks[1][0].evaluation.verdict, Verdict::Pass);
+            let step = &result.execution.step_results[1];
+            assert_eq!(step.extracted_outputs["variant"], json!(variant));
+            assert!(step.sensitive_response);
+        }
+        assert!(run.findings.is_empty());
+    }
 
     fn select_body(body: &[u8], path: &[&str]) -> SelectedValue {
         let response = HttpObservation {
@@ -713,7 +931,7 @@ mod tests {
             }),
         });
         let requests = std::cell::Cell::new(0);
-        let port = Url::parse("http://127.0.0.1")
+        let port = url::Url::parse("http://127.0.0.1")
             .unwrap()
             .port_or_known_default();
         let runtime = RuntimeInputs::prepare(&experiment, port, |_| {

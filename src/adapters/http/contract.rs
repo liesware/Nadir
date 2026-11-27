@@ -29,8 +29,36 @@ pub type Sha256Digest = [u8; 32];
 pub struct ResolvedContract {
     pub openapi_version: String,
     pub fingerprint: Sha256Digest,
-    pub operations: HashMap<String, ResolvedOperation>,
+    operations: OperationIndex,
     pub referenced_files: Vec<ReferencedFile>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OperationIndex {
+    by_key: HashMap<String, ResolvedOperation>,
+    by_id: HashMap<String, String>,
+}
+
+impl ResolvedContract {
+    pub fn operation_by_id(&self, id: &str) -> Option<&ResolvedOperation> {
+        self.operation(self.operations.by_id.get(id)?)
+    }
+
+    pub(crate) fn operation(&self, key: &str) -> Option<&ResolvedOperation> {
+        self.operations.by_key.get(key)
+    }
+}
+
+pub(crate) fn parse_operation_path(selector: &str) -> Option<String> {
+    let (path, method) = selector.rsplit_once('.')?;
+    if !path.starts_with('/') || path.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(operation_key(path, HttpMethod::from_str(method)?))
+}
+
+fn operation_key(path: &str, method: HttpMethod) -> String {
+    format!("{path}.{}", method.as_str())
 }
 
 /// A file that was referenced via `$ref` during resolution.
@@ -43,7 +71,7 @@ pub struct ReferencedFile {
 /// One operation extracted from the OpenAPI document.
 #[derive(Debug, Clone)]
 pub struct ResolvedOperation {
-    pub operation_id: String,
+    pub operation_id: Option<String>,
     pub method: HttpMethod,
     pub path_template: String,
     pub path_params: Vec<ParamDecl>,
@@ -54,6 +82,14 @@ pub struct ResolvedOperation {
 }
 
 impl ResolvedOperation {
+    pub(crate) fn key(&self) -> String {
+        operation_key(&self.path_template, self.method)
+    }
+
+    pub(crate) fn label(&self) -> String {
+        self.operation_id.clone().unwrap_or_else(|| self.key())
+    }
+
     /// Return the JSON schema declared for an exact HTTP status code.
     ///
     /// Returns `None` when the status code is not declared in the contract.
@@ -105,6 +141,8 @@ pub struct ParamDecl {
     pub name: String,
     pub required: bool,
     pub schema: ParamSchema,
+    /// The parameter's full JSON Schema (`$ref`s resolved); `{}` when absent.
+    pub schema_json: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -179,8 +217,6 @@ pub enum ContractError {
     NetworkRef(String),
     #[error("unsupported OpenAPI construct: {0}")]
     UnsupportedConstruct(String),
-    #[error("missing operationId")]
-    MissingOperationId,
 }
 
 impl From<serde_yaml::Error> for ContractError {
@@ -258,32 +294,28 @@ impl RefResolver {
 
     /// Resolve all `$ref`s in the document tree in-place.
     fn resolve_document(&mut self, doc: &Value) -> Result<Value, ContractError> {
-        self.resolve_value(doc, "#")
+        self.resolve_value(doc, doc)
     }
 
-    fn resolve_value(&mut self, value: &Value, current_path: &str) -> Result<Value, ContractError> {
+    fn resolve_value(&mut self, value: &Value, document: &Value) -> Result<Value, ContractError> {
         match value {
             Value::Object(obj) => {
                 // If this object is a $ref, resolve it
                 if let Some(ref_str) = obj.get("$ref").and_then(|v| v.as_str()) {
-                    return self.resolve_ref(ref_str, current_path);
+                    return self.resolve_ref(ref_str, document);
                 }
 
                 // Otherwise, recursively resolve children
                 let mut resolved = serde_json::Map::new();
                 for (key, val) in obj {
-                    let child_path = format!("{}/{}", current_path, key);
-                    resolved.insert(key.clone(), self.resolve_value(val, &child_path)?);
+                    resolved.insert(key.clone(), self.resolve_value(val, document)?);
                 }
                 Ok(Value::Object(resolved))
             }
             Value::Array(arr) => {
                 let resolved: Vec<Value> = arr
                     .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        self.resolve_value(v, &format!("{}/{}", current_path, i))
-                    })
+                    .map(|value| self.resolve_value(value, document))
                     .collect::<Result<_, _>>()?;
                 Ok(Value::Array(resolved))
             }
@@ -291,7 +323,7 @@ impl RefResolver {
         }
     }
 
-    fn resolve_ref(&mut self, ref_str: &str, _current_path: &str) -> Result<Value, ContractError> {
+    fn resolve_ref(&mut self, ref_str: &str, document: &Value) -> Result<Value, ContractError> {
         // Reject network references
         if ref_str.starts_with("http://") || ref_str.starts_with("https://") {
             return Err(ContractError::NetworkRef(ref_str.to_string()));
@@ -318,11 +350,10 @@ impl RefResolver {
             return Err(ContractError::CyclicRef(target_key));
         }
 
-        // Load and resolve the target file if not the main one
-        let doc: Value = if target_file == self.main_file {
-            // Already loaded — we need to re-read for fresh resolution context
-            let raw_bytes = fs::read(&target_file)?;
-            serde_yaml::from_slice(&raw_bytes)?
+        // Internal references reuse the already parsed document.
+        let external;
+        let target = if target_file == self.main_file {
+            document
         } else {
             let raw_bytes = fs::read(&target_file)?;
             let fingerprint: Sha256Digest = Sha256::digest(&raw_bytes).into();
@@ -330,26 +361,26 @@ impl RefResolver {
                 path: target_file.clone(),
                 fingerprint,
             });
-            serde_yaml::from_slice(&raw_bytes)?
+            external = serde_yaml::from_slice(&raw_bytes)?;
+            &external
         };
 
         // Resolve the fragment pointer within the document
         self.resolving.push(target_key.clone());
         let resolved = if fragment.is_empty() || fragment == "/" {
-            self.resolve_document(&doc)?
+            self.resolve_value(target, document)
         } else {
-            let fragment_value = resolve_json_pointer(&doc, fragment).ok_or_else(|| {
+            resolve_json_pointer(target, fragment).ok_or_else(|| {
                 ContractError::UnresolvedRef(format!(
                     "fragment '{}' not found in '{}'",
                     fragment,
                     target_file.display()
                 ))
-            })?;
-            self.resolve_value(fragment_value, fragment)?
+            }).and_then(|value| self.resolve_value(value, document))
         };
         self.resolving.pop();
 
-        Ok(resolved)
+        resolved
     }
 }
 
@@ -384,7 +415,7 @@ fn resolve_json_pointer<'a>(doc: &'a Value, pointer: &str) -> Option<&'a Value> 
 
 // ── Operation extraction ───────────────────────────────────────────
 
-fn extract_operations(doc: &Value) -> Result<HashMap<String, ResolvedOperation>, ContractError> {
+fn extract_operations(doc: &Value) -> Result<OperationIndex, ContractError> {
     let paths = doc
         .get("paths")
         .and_then(|v| v.as_object())
@@ -392,7 +423,7 @@ fn extract_operations(doc: &Value) -> Result<HashMap<String, ResolvedOperation>,
 
     let security_schemes = extract_security_schemes(doc);
 
-    let mut operations = HashMap::new();
+    let mut operations = OperationIndex::default();
 
     for (path_template, path_item) in paths {
         let path_obj = path_item
@@ -420,14 +451,19 @@ fn extract_operations(doc: &Value) -> Result<HashMap<String, ResolvedOperation>,
                 &security_schemes,
             )?;
 
-            let op_id = operation.operation_id.clone();
-            if operations.contains_key(&op_id) {
+            let key = operation.key();
+            if let Some(id) = &operation.operation_id {
+                if operations.by_id.insert(id.clone(), key.clone()).is_some() {
+                    return Err(ContractError::UnsupportedConstruct(format!(
+                        "duplicate operationId '{id}'"
+                    )));
+                }
+            }
+            if operations.by_key.insert(key.clone(), operation).is_some() {
                 return Err(ContractError::UnsupportedConstruct(format!(
-                    "duplicate operationId '{}'",
-                    op_id
+                    "duplicate operation '{key}'"
                 )));
             }
-            operations.insert(op_id, operation);
         }
     }
 
@@ -454,9 +490,15 @@ fn extract_operation(
 
     let operation_id = op_obj
         .get("operationId")
-        .and_then(|v| v.as_str())
-        .ok_or(ContractError::MissingOperationId)?
-        .to_string();
+        .map(|id| {
+            id.as_str().map(str::to_owned).ok_or_else(|| {
+                ContractError::UnsupportedConstruct(format!(
+                    "operationId must be a string on {method} {path_template}",
+                    method = method.as_str(),
+                ))
+            })
+        })
+        .transpose()?;
 
     // Extract parameters
     let all_params = extract_parameters(op, &path_template)?;
@@ -568,6 +610,7 @@ fn extract_parameters(
                     param_type: "path".into(),
                     enum_values: None,
                 },
+                schema_json: Value::Object(Default::default()),
             });
         }
     }
@@ -596,6 +639,7 @@ fn parse_parameter(param: &Value) -> Option<ParamDecl> {
             param_type: location,
             enum_values,
         },
+        schema_json: obj.get("schema").cloned().unwrap_or_else(|| Value::Object(Default::default())),
     })
 }
 
@@ -722,34 +766,40 @@ pub fn build_baseline_input(
     operation: &ResolvedOperation,
     bindings: &[Binding],
 ) -> Result<Value, InputBuildError> {
-    let body = match &operation.request_body {
-        Some(rb) => rb,
-        None => return Ok(Value::Null),
-    };
+    build_baseline_input_with_example(operation, bindings, None)
+}
 
-    if body.content_type != "application/json" {
-        return Err(InputBuildError::UnsupportedContentType(
-            body.content_type.clone(),
-        ));
-    }
-
-    // Start from the example if one exists, otherwise empty object
-    let mut input = body.example.clone().unwrap_or(Value::Object(serde_json::Map::new()));
-
-    // Apply bindings: overwrite specific fields
-    for binding in bindings {
-        match &binding.selector {
-            InputSelector::BodyField(path) => {
-                let value = resolve_binding_value_to_json(binding);
-                set_json_path(&mut input, path, value);
-            }
-            _ => {
-                // Path params and headers are not part of the JSON body
-            }
+pub(crate) fn build_baseline_input_with_example(
+    operation: &ResolvedOperation,
+    bindings: &[Binding],
+    example: Option<&Value>,
+) -> Result<Value, InputBuildError> {
+    if let Some(body) = &operation.request_body {
+        if body.content_type != "application/json" {
+            return Err(InputBuildError::UnsupportedContentType(body.content_type.clone()));
         }
     }
+    Ok(request_body_with_example(operation, bindings, example))
+}
 
-    Ok(input)
+pub(crate) fn request_body_with_example(
+    operation: &ResolvedOperation,
+    bindings: &[Binding],
+    example: Option<&Value>,
+) -> Value {
+    let Some(body) = &operation.request_body else {
+        return Value::Null;
+    };
+    let mut input = example
+        .or(body.example.as_ref())
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    for binding in bindings {
+        if let InputSelector::BodyField(path) = &binding.selector {
+            crate::formats::json::set(&mut input, path, resolve_binding_value_to_json(binding));
+        }
+    }
+    input
 }
 
 fn resolve_binding_value_to_json(binding: &Binding) -> Value {
@@ -772,39 +822,40 @@ fn resolve_binding_value_to_json(binding: &Binding) -> Value {
     }
 }
 
-/// Set a value at a JSON path (e.g., `["metadata", "source"]`).
-fn set_json_path(root: &mut Value, path: &[String], value: Value) {
-    if path.is_empty() {
-        *root = value;
-        return;
-    }
-
-    let obj = match root {
-        Value::Object(ref mut map) => map,
-        _ => {
-            *root = Value::Object(serde_json::Map::new());
-            root.as_object_mut().unwrap()
-        }
-    };
-
-    if path.len() == 1 {
-        obj.insert(path[0].clone(), value);
-        return;
-    }
-
-    let first = &path[0];
-    let child = obj
-        .entry(first.clone())
-        .or_insert(Value::Object(serde_json::Map::new()));
-    set_json_path(child, &path[1..], value);
-}
-
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn indexes_paths_independently_of_operation_ids() {
+        let doc = serde_json::json!({
+            "paths": {
+                "/v1.0/report": {
+                    "get": {"operationId": "/v1.0/report.POST"},
+                    "post": {}
+                }
+            }
+        });
+        let operations = extract_operations(&doc).unwrap();
+        let id_key = &operations.by_id["/v1.0/report.POST"];
+        assert_eq!(id_key, &parse_operation_path("/v1.0/report.get").unwrap());
+        assert_eq!(operations.by_key[id_key].method, HttpMethod::Get);
+        let post_key = parse_operation_path("/v1.0/report.pOsT").unwrap();
+        assert_eq!(operations.by_key[&post_key].method, HttpMethod::Post);
+        assert!(operations.by_key[&post_key].operation_id.is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_operation_ids() {
+        let doc = serde_json::json!({
+            "paths": {"/report": {"get": {"operationId": "report"}, "post": {"operationId": "report"}}}
+        });
+        let error = extract_operations(&doc).unwrap_err();
+        assert!(error.to_string().contains("duplicate operationId 'report'"));
+    }
 
     fn examples_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
@@ -816,10 +867,10 @@ mod tests {
         let contract = load_contract(&path).expect("should load contract");
 
         assert_eq!(contract.openapi_version, "3.1.0");
-        assert_eq!(contract.operations.len(), 5); // login, getTemplate, createRecord, getRecordByReference, probeString
+        assert_eq!(contract.operations.by_key.len(), 5); // login, getTemplate, createRecord, getRecordByReference, probeString
 
         // Check login operation
-        let login = contract.operations.get("login").expect("login operation");
+        let login = contract.operation_by_id("login").expect("login operation");
         assert_eq!(login.method, HttpMethod::Post);
         assert_eq!(login.path_template, "/login");
         assert!(login.request_body.is_some());
@@ -830,7 +881,7 @@ mod tests {
         assert!(login_body.required_fields.contains(&"pass".to_string()));
 
         // Check getTemplate operation
-        let get_tpl = contract.operations.get("getTemplate").expect("getTemplate");
+        let get_tpl = contract.operation_by_id("getTemplate").expect("getTemplate");
         assert_eq!(get_tpl.method, HttpMethod::Get);
         assert_eq!(get_tpl.path_template, "/templates/{id}");
         assert_eq!(get_tpl.path_params.len(), 1);
@@ -845,8 +896,7 @@ mod tests {
 
         // Check createRecord operation
         let create = contract
-            .operations
-            .get("createRecord")
+            .operation_by_id("createRecord")
             .expect("createRecord");
         assert_eq!(create.method, HttpMethod::Post);
         let create_body = create.request_body.as_ref().unwrap();
@@ -856,14 +906,13 @@ mod tests {
 
         // Check getRecordByReference
         let get_rec = contract
-            .operations
-            .get("getRecordByReference")
+            .operation_by_id("getRecordByReference")
             .expect("getRecordByReference");
         assert_eq!(get_rec.method, HttpMethod::Get);
         assert_eq!(get_rec.path_template, "/records/{reference}");
 
         // Check probeString
-        let probe = contract.operations.get("probeString").expect("probeString");
+        let probe = contract.operation_by_id("probeString").expect("probeString");
         assert_eq!(probe.method, HttpMethod::Post);
         assert_eq!(probe.path_template, "/probe");
     }
@@ -880,7 +929,8 @@ mod tests {
             PathBuf::from("."),
             PathBuf::from("test.yaml"),
         );
-        let result = resolver.resolve_ref("https://example.com/schema.json#/foo", "#");
+        let document = serde_json::json!({"$ref": "https://example.com/schema.json#/foo"});
+        let result = resolver.resolve_document(&document);
         assert!(matches!(result, Err(ContractError::NetworkRef(_))));
     }
 
@@ -895,7 +945,7 @@ mod tests {
     fn test_builds_baseline_from_example() {
         let path = examples_dir().join("create-record/openapi.yaml");
         let contract = load_contract(&path).unwrap();
-        let op = contract.operations.get("createRecord").unwrap();
+        let op = contract.operation_by_id("createRecord").unwrap();
         let bindings: Vec<Binding> = vec![];
         let input = build_baseline_input(op, &bindings).unwrap();
 
@@ -912,7 +962,7 @@ mod tests {
 
         let path = examples_dir().join("create-record/openapi.yaml");
         let contract = load_contract(&path).unwrap();
-        let op = contract.operations.get("createRecord").unwrap();
+        let op = contract.operation_by_id("createRecord").unwrap();
 
         let bindings = vec![
             Binding {

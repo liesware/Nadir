@@ -52,7 +52,7 @@ pub fn build_case_signature(case: &CaseResult) -> CaseSignature {
             }
             .to_string();
 
-            let status = sr.observation.as_ref().map(|o| o.status);
+            let status = sr.observation.as_ref().and_then(|observation| observation.http_status());
 
             // Verdicts are evaluated later (in the oracle phase).
             // For signature, we use empty — verdicts get merged in during
@@ -123,14 +123,15 @@ mod tests {
     #[test]
     fn test_signature_deterministic() {
         let step1 = StepResult {
+            request_diagnostic: None,
             step_id: "login".into(),
             outcome: StepOutcome::Completed,
-            observation: Some(HttpObservation {
+            observation: Some(crate::observation::StepObservation::Http(HttpObservation {
                 status: 200,
                 headers: vec![],
                 body: b"{\"token\":\"abc\"}".to_vec(),
                 truncated: false,
-            }),
+            })),
             extracted_outputs: HashMap::new(),
             sensitive_response: false,
         };
@@ -150,27 +151,29 @@ mod tests {
     #[test]
     fn test_signature_differs_on_status() {
         let step_ok = StepResult {
+            request_diagnostic: None,
             step_id: "login".into(),
             outcome: StepOutcome::Completed,
-            observation: Some(HttpObservation {
+            observation: Some(crate::observation::StepObservation::Http(HttpObservation {
                 status: 200,
                 headers: vec![],
                 body: vec![],
                 truncated: false,
-            }),
+            })),
             extracted_outputs: HashMap::new(),
             sensitive_response: false,
         };
 
         let step_err = StepResult {
+            request_diagnostic: None,
             step_id: "login".into(),
             outcome: StepOutcome::Completed,
-            observation: Some(HttpObservation {
+            observation: Some(crate::observation::StepObservation::Http(HttpObservation {
                 status: 401,
                 headers: vec![],
                 body: vec![],
                 truncated: false,
-            }),
+            })),
             extracted_outputs: HashMap::new(),
             sensitive_response: false,
         };
@@ -194,26 +197,28 @@ mod tests {
     #[test]
     fn test_signature_excludes_body() {
         let step_a = StepResult {
+            request_diagnostic: None,
             step_id: "s1".into(),
             outcome: StepOutcome::Completed,
-            observation: Some(HttpObservation {
+            observation: Some(crate::observation::StepObservation::Http(HttpObservation {
                 status: 200,
                 headers: vec![],
                 body: b"body-A".to_vec(),
                 truncated: false,
-            }),
+            })),
             extracted_outputs: HashMap::new(),
             sensitive_response: false,
         };
         let step_b = StepResult {
+            request_diagnostic: None,
             step_id: "s1".into(),
             outcome: StepOutcome::Completed,
-            observation: Some(HttpObservation {
+            observation: Some(crate::observation::StepObservation::Http(HttpObservation {
                 status: 200,
                 headers: vec![],
                 body: b"different-body".to_vec(),
                 truncated: false,
-            }),
+            })),
             extracted_outputs: HashMap::new(),
             sensitive_response: false,
         };

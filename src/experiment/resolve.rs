@@ -15,9 +15,9 @@ use crate::experiment::selectors::{
     self, BindingParseResult, ObservationSelector, Reference,
 };
 use crate::experiment::types::{
-    AdapterConfigs, AdapterKind, AuthConfig, Binding, BindingValue, CompositePart,
+    ProtocolConfigs, DebugMode, HttpField, MAX_DEBUG_AUTO_S, ProtocolKind, AuthConfig, Binding, BindingValue, CompositePart,
     CoverageConfig, CoverageTransport, ExpectCondition, ExplorationConfig,
-    ExplorationStrategy, Experiment, FieldSchema, HttpAdapterConfig, JsonMutatorMode,
+    ExplorationStrategy, Experiment, FieldSchema, HttpProtocolConfig, JsonMutatorMode,
     MaxCases, MutatorDecl, OracleDecl, OracleKind, OracleType, OutputDecl,
     ReadyConfig, Step, TargetConfig, WhenCondition,
 };
@@ -28,12 +28,13 @@ use crate::experiment::types::{
 pub enum ResolutionError {
     #[error("target.{field}: {detail}")]
     InvalidTargetReference { field: String, detail: String },
-    #[error("unknown adapter name: '{0}'")]
-    UnknownAdapter(String),
-    #[error("operation '{operation_id}' not found in contract for adapter '{adapter}'")]
+    #[error("unknown protocol name: '{0}'")]
+    UnknownProtocol(String),
+    #[error("step '{step_id}': operation '{selector}' not found in contract for protocol '{protocol}'")]
     UnknownOperation {
-        adapter: String,
-        operation_id: String,
+        step_id: String,
+        protocol: String,
+        selector: String,
     },
     #[error("step '{step_id}': required path parameter '{parameter}' has no binding")]
     MissingPathBinding { step_id: String, parameter: String },
@@ -64,10 +65,12 @@ pub enum ResolutionError {
     UnsupportedConstruct { step_id: String, detail: String },
     #[error("contract error: {0}")]
     Contract(#[from] contract::ContractError),
-    #[error("invalid mutator mode '{mode}' in step '{step_id}'")]
+    #[error("step '{step_id}': unknown mutator mode '{mode}' (expected edge_cases, unconstrained, schema, alpha, alphanum or raw; use: http also takes values and absent)")]
     InvalidMutatorMode { step_id: String, mode: String },
     #[error("step '{step_id}': mutator type (use) missing")]
     MissingMutatorType { step_id: String },
+    #[error("{0}")]
+    InvalidHidden(String),
 }
 
 // ── Main entry point ───────────────────────────────────────────────
@@ -87,20 +90,48 @@ pub fn resolve_experiment(
     // Resolve target
     let target = resolve_target(&block)?;
 
-    // Resolve adapters
-    let adapters = resolve_adapters(&block, experiment_dir)?;
+    // Resolve protocols
+    let protocols = resolve_protocols(&block, experiment_dir)?;
 
     // Resolve steps (ordered, with contract-aware checks)
-    let steps = resolve_steps(&block.steps, &adapters, contracts)?;
+    let steps = resolve_steps(&block.steps, &protocols, contracts, experiment_dir)?;
+    if matches!(exploration.strategy, ExplorationStrategy::Enumerate) {
+        if let Some(step) = steps.iter().find(|step| !step.key_mutators.is_empty()) {
+            return Err(ResolutionError::UnsupportedConstruct {
+                step_id: step.id.clone(),
+                detail: "generated key renames require strategy: fuzz".into(),
+            });
+        }
+    }
 
-    Ok(Experiment {
+    let experiment = Experiment {
         name: block.name,
         max_cases: MaxCases::new(block.max_cases),
         exploration,
         target,
-        adapters,
+        protocols,
         steps,
-    })
+        hidden: block.hidden.unwrap_or_default(),
+    };
+    resolve_hidden(&experiment)?;
+    Ok(experiment)
+}
+
+/// Each `hidden` name must be read by some `${env.NAME}`, once.
+fn resolve_hidden(experiment: &Experiment) -> Result<(), ResolutionError> {
+    let used = experiment.env_references();
+    let mut seen = HashSet::new();
+    for name in &experiment.hidden {
+        if !seen.insert(name.as_str()) {
+            return Err(ResolutionError::InvalidHidden(format!("hidden variable '{name}' is listed twice")));
+        }
+        if !used.iter().any(|(known, _)| known == name) {
+            return Err(ResolutionError::InvalidHidden(format!(
+                "hidden variable '{name}' is not used in any ${{env.{name}}} reference"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ── Exploration ─────────────────────────────────────────────────────
@@ -123,6 +154,7 @@ fn resolve_exploration(
             max_execs: expl.max_execs.unwrap_or(10000),
             duration_s: expl.duration_s.unwrap_or(60),
             seed: expl.seed,
+            max_fields: expl.max_fields,
         },
         other => {
             return Err(ResolutionError::UnsupportedConstruct {
@@ -206,27 +238,28 @@ fn resolve_target(
 
 // ── Adapters ────────────────────────────────────────────────────────
 
-fn resolve_adapters(
+fn resolve_protocols(
     block: &RawExperimentBlock,
     _experiment_dir: &Path,
-) -> Result<AdapterConfigs, ResolutionError> {
-    let http = block.adapters.http.as_ref().map(|http_adapter| {
-        HttpAdapterConfig {
+) -> Result<ProtocolConfigs, ResolutionError> {
+    let http = block.protocols.http.as_ref().map(|http_adapter| {
+        HttpProtocolConfig {
             base_url: http_adapter.base_url.clone(),
             openapi_path: http_adapter.openapi.clone(),
             timeout_ms: http_adapter.timeout_ms,
         }
     });
 
-    Ok(AdapterConfigs { http })
+    Ok(ProtocolConfigs { http })
 }
 
 // ── Steps ───────────────────────────────────────────────────────────
 
 fn resolve_steps(
     raw_steps: &[RawStep],
-    adapters: &AdapterConfigs,
+    protocols: &ProtocolConfigs,
     contracts: &HashMap<String, ResolvedContract>,
+    experiment_dir: &Path,
 ) -> Result<Vec<Step>, ResolutionError> {
     // Track declared output names per step (for cross-step ref validation)
     let mut declared_outputs: HashMap<String, HashSet<String>> = HashMap::new();
@@ -234,37 +267,59 @@ fn resolve_steps(
     let step_names: HashSet<&str> = raw_steps.iter().map(|s| s.id.as_str()).collect();
 
     for raw_step in raw_steps {
-        // Resolve adapter kind
-        let adapter_kind = match raw_step.adapter.as_str() {
-            "http" => AdapterKind::Http,
+        // Resolve protocol kind
+        let protocol_kind = match raw_step.protocol.as_str() {
+            "http" => ProtocolKind::Http,
+            "http_raw" => ProtocolKind::HttpRaw,
             other => {
-                return Err(ResolutionError::UnknownAdapter(other.into()));
+                return Err(ResolutionError::UnknownProtocol(other.into()));
             }
         };
 
         // Look up the contract and operation
-        let contract = match adapter_kind {
-            AdapterKind::Http => adapters.http.as_ref().and_then(|http_cfg| {
+        let contract = match protocol_kind {
+            // `http_raw` builds its requests from the same contract.
+            ProtocolKind::Http | ProtocolKind::HttpRaw => protocols.http.as_ref().and_then(|http_cfg| {
                 contracts.get(http_cfg.openapi_path.as_str())
             }),
+            #[cfg(test)]
+            ProtocolKind::InMemory => None,
         };
 
-        let operation = match contract {
-            Some(c) => c.operations.get(&raw_step.operation_id).ok_or_else(|| {
-                ResolutionError::UnknownOperation {
-                    adapter: raw_step.adapter.clone(),
-                    operation_id: raw_step.operation_id.clone(),
-                }
-            })?,
-            None => {
-                // No contract means we can't validate, but we still resolve
-                // (the validate command may run without contracts)
-                return Err(ResolutionError::UnknownOperation {
-                    adapter: raw_step.adapter.clone(),
-                    operation_id: raw_step.operation_id.clone(),
-                });
-            }
+        let invalid = |detail| ResolutionError::UnsupportedConstruct {
+            step_id: raw_step.id.clone(),
+            detail,
         };
+        let format = match raw_step.format.as_deref().unwrap_or("json") {
+            "json" => crate::formats::PayloadFormat::Json,
+            other => return Err(invalid(format!("unknown format '{other}', expected json"))),
+        };
+        let (selector, operation) = match (&raw_step.operation_id, &raw_step.operation_path) {
+            (Some(id), None) => (id, contract.and_then(|c| c.operation_by_id(id))),
+            (None, Some(path)) => {
+                let key = contract::parse_operation_path(path).ok_or_else(|| {
+                    invalid(format!("invalid operation_path '{path}', expected /path.method"))
+                })?;
+                (path, contract.and_then(|c| c.operation(&key)))
+            }
+            _ => return Err(invalid("specify exactly one of operation_id and operation_path".into())),
+        };
+        let operation = operation.ok_or_else(|| ResolutionError::UnknownOperation {
+            step_id: raw_step.id.clone(),
+            protocol: raw_step.protocol.clone(),
+            selector: selector.clone(),
+        })?;
+
+        if raw_step.body_example.is_some()
+            && operation
+                .request_body
+                .as_ref()
+                .is_none_or(|body| body.content_type != "application/json")
+        {
+            return Err(invalid("body_example requires an application/json request body".into()));
+        }
+
+        check_layer(raw_step, protocol_kind).map_err(invalid)?;
 
         // Check auth on unsecured op
         if raw_step.auth.is_some() {
@@ -272,7 +327,7 @@ fn resolve_steps(
             if !has_bearer {
                 return Err(ResolutionError::AuthOnUnsecuredOp {
                     step_id: raw_step.id.clone(),
-                    operation_id: raw_step.operation_id.clone(),
+                    operation_id: selector.clone(),
                 });
             }
         }
@@ -322,29 +377,69 @@ fn resolve_steps(
         )?;
 
         // Resolve mutators
-        let mutators = resolve_mutators(raw_step, operation)?;
+        let (mutators, corpora) = resolve_mutators(raw_step, operation, experiment_dir)?;
 
         let mut declared_statuses: Vec<u16> = operation.responses.keys().copied().collect();
         declared_statuses.sort_unstable();
 
         // Resolve examples
-        let examples = resolve_examples(raw_step)?;
+        let (examples, key_mutators) = resolve_examples(raw_step, operation, &bindings)?;
+
+        let debug = match &raw_step.debug {
+            None | Some(crate::config::RawDebug::Enabled(false)) => None,
+            Some(crate::config::RawDebug::Enabled(true)) => Some(DebugMode::Manual),
+            Some(crate::config::RawDebug::Auto(auto)) => {
+                if !(1..=MAX_DEBUG_AUTO_S).contains(&auto.auto) {
+                    return Err(ResolutionError::UnsupportedConstruct {
+                        step_id: raw_step.id.clone(),
+                        detail: format!("debug.auto must be between 1 and {MAX_DEBUG_AUTO_S} seconds"),
+                    });
+                }
+                Some(DebugMode::Auto(std::time::Duration::from_secs(u64::from(auto.auto))))
+            }
+        };
 
         resolved_steps.push(Step {
             id: raw_step.id.clone(),
-            adapter: adapter_kind,
-            operation_id: raw_step.operation_id.clone(),
+            protocol: protocol_kind,
+            format,
+            operation_key: operation.key(),
+            body_example: raw_step.body_example.clone(),
             bindings,
             auth,
             outputs,
             mutators,
+            corpora,
+            key_mutators,
             oracles,
             examples,
             declared_statuses,
+            print: raw_step.print.unwrap_or(false),
+            debug,
         });
     }
 
     Ok(resolved_steps)
+}
+
+/// Each step tests one layer: `http_raw` steps take only `malform`, and
+/// `malform` only runs on `http_raw` steps.
+fn check_layer(raw_step: &RawStep, protocol: ProtocolKind) -> Result<(), String> {
+    let mutators = raw_step.cases.as_ref().map(|cases| cases.mutators.as_slice()).unwrap_or_default();
+    if protocol == ProtocolKind::HttpRaw {
+        if let Some(other) = mutators.iter().find(|mutator| mutator.r#use != "malform") {
+            return Err(format!("protocol: http_raw only takes use: malform, found use: {}", other.r#use));
+        }
+        if raw_step.cases.as_ref().is_some_and(|cases| !cases.examples.is_empty()) {
+            return Err("protocol: http_raw does not take cases.examples".into());
+        }
+        if raw_step.outputs.as_ref().is_some_and(|outputs| !outputs.is_empty()) {
+            return Err("protocol: http_raw does not take outputs: a malformed response cannot feed other steps".into());
+        }
+    } else if mutators.iter().any(|mutator| mutator.r#use == "malform") {
+        return Err("use: malform requires protocol: http_raw".into());
+    }
+    Ok(())
 }
 
 // ── Bindings ────────────────────────────────────────────────────────
@@ -635,13 +730,23 @@ fn resolve_oracles(
 
 // ── Mutators ────────────────────────────────────────────────────────
 
+const JSON_MUTATOR_MODES: &[&str] = &[
+    "edge_cases", "schema_valid", "unconstrained", "schema", "alpha", "alphanum", "alphanumeric", "raw",
+];
+/// `use: http` adds `values` (only the listed values) and `absent`.
+const HTTP_MUTATOR_MODES: &[&str] = &[
+    "edge_cases", "schema_valid", "unconstrained", "schema", "alpha", "alphanum", "alphanumeric", "raw",
+    "values", "absent",
+];
+
 fn resolve_mutators(
     raw_step: &RawStep,
     operation: &ResolvedOperation,
-) -> Result<Vec<MutatorDecl>, ResolutionError> {
+    experiment_dir: &Path,
+) -> Result<(Vec<MutatorDecl>, Vec<crate::mutation::text::Corpus>), ResolutionError> {
     let cases = match &raw_step.cases {
         Some(RawStepCases { mutators, .. }) => mutators,
-        None => return Ok(Vec::new()),
+        None => return Ok((Vec::new(), Vec::new())),
     };
     let invalid = |detail: String| ResolutionError::UnsupportedConstruct {
         step_id: raw_step.id.clone(),
@@ -649,13 +754,63 @@ fn resolve_mutators(
     };
 
     let mut result = Vec::new();
+    let mut corpora = Vec::new();
     for raw in cases {
+        let mutator = raw.r#use.as_str();
+        if raw.keys.is_some() || raw.rename_to.is_some() {
+            continue; // Deterministic key renames are resolved alongside the examples.
+        }
+        if raw.expect_status.is_some() {
+            return Err(invalid("mutator expect_status requires keys and rename_to".into()));
+        }
+        if matches!(mutator, "file" | "file_fuzz") {
+            let corpus = resolve_corpus(raw, operation, experiment_dir).map_err(invalid)?;
+            corpora.push(corpus);
+            continue;
+        }
+        if raw.path.is_some() || raw.repetitions.is_some() || raw.seed.is_some() {
+            return Err(invalid("path, repetitions and seed are corpus options".into()));
+        }
+        let known_modes = match mutator {
+            "json" => Some(JSON_MUTATOR_MODES),
+            "http" => Some(HTTP_MUTATOR_MODES),
+            _ => None,
+        };
+        if let (Some(modes), Some(other)) = (known_modes, raw.mode.as_deref()) {
+            if !modes.contains(&other) {
+                return Err(ResolutionError::InvalidMutatorMode {
+                    step_id: raw_step.id.clone(),
+                    mode: other.into(),
+                });
+            }
+        }
+        if mutator == "headers" && (raw.mode.is_some() || raw.length.is_some()) {
+            return Err(invalid(
+                "use: headers only takes fields and values; use: http for modes and length".into(),
+            ));
+        }
+        if raw.length.is_some()
+            && (!matches!(mutator, "json" | "http")
+                || !matches!(raw.mode.as_deref(), Some("alpha" | "alphanum" | "alphanumeric" | "raw")))
+        {
+            let found = match raw.mode.as_deref() {
+                Some(mode) => format!("use: {mutator}, mode: {mode}"),
+                None => format!("use: {mutator} without mode"),
+            };
+            return Err(invalid(format!(
+                "length requires use: json or http with mode: alpha, alphanum or raw (found {found})"
+            )));
+        }
         let decl = match raw.r#use.as_str() {
             "json" => {
                 let mode = match raw.mode.as_deref().unwrap_or("edge_cases") {
                     "edge_cases" | "schema_valid" => JsonMutatorMode::EdgeCases,
                     "unconstrained" => JsonMutatorMode::Unconstrained,
                     "schema" => JsonMutatorMode::Schema,
+                    "alphanum" | "alphanumeric" if raw.length.is_none() => JsonMutatorMode::Alphanumeric,
+                    "alpha" | "alphanum" | "alphanumeric" | "raw" => {
+                        JsonMutatorMode::Text(resolve_text_generator(raw, operation).map_err(invalid)?)
+                    }
                     other => {
                         return Err(ResolutionError::InvalidMutatorMode {
                             step_id: raw_step.id.clone(),
@@ -674,7 +829,7 @@ fn resolve_mutators(
                         None if mode == JsonMutatorMode::Schema => {
                             return Err(invalid(format!(
                                 "mode: schema needs field '{field}' in the request schema of '{}'",
-                                operation.operation_id
+                                operation.label()
                             )));
                         }
                         None => {}
@@ -687,21 +842,8 @@ fn resolve_mutators(
                     field_schemas,
                 }
             }
-            "headers" => {
-                let fields = raw.fields.clone().unwrap_or_default();
-                let values = raw
-                    .values
-                    .iter()
-                    .flatten()
-                    .map(|value| match value {
-                        Value::String(text) => Ok(text.clone()),
-                        other => Err(invalid(format!(
-                            "header values must be strings, found {other}"
-                        ))),
-                    })
-                    .collect::<Result<_, _>>()?;
-                MutatorDecl::Headers { fields, values }
-            }
+            "http" | "headers" => resolve_http_mutator(raw, operation).map_err(invalid)?,
+            "malform" => resolve_malform(raw).map_err(invalid)?,
             _other => {
                 return Err(ResolutionError::MissingMutatorType {
                     step_id: raw_step.id.clone(),
@@ -711,7 +853,195 @@ fn resolve_mutators(
         result.push(decl);
     }
 
-    Ok(result)
+    Ok((result, corpora))
+}
+
+/// `use: http`, or its alias `use: headers` (header names, `values` only).
+fn resolve_http_mutator(
+    raw: &crate::config::RawMutator,
+    operation: &ResolvedOperation,
+) -> Result<MutatorDecl, String> {
+    let legacy = raw.r#use == "headers";
+    let raw_fields = raw.fields.as_deref().unwrap_or_default();
+    if raw_fields.is_empty() {
+        return Err(format!("use: {} requires fields", raw.r#use));
+    }
+    let mut fields = Vec::new();
+    for raw_field in raw_fields {
+        let field = if legacy {
+            HttpField::Header(raw_field.clone())
+        } else {
+            HttpField::parse(raw_field).ok_or_else(|| {
+                format!("http field '{raw_field}' must start with header. or path.")
+            })?
+        };
+        match &field {
+            HttpField::Header(name) => {
+                http::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| format!("invalid header name '{name}'"))?;
+            }
+            HttpField::Path(name) => {
+                if !operation.path_params.iter().any(|param| &param.name == name) {
+                    return Err(format!(
+                        "path parameter '{name}' is not in the path of '{}'",
+                        operation.label()
+                    ));
+                }
+            }
+        }
+        fields.push(field);
+    }
+    let mode = match raw.mode.as_deref().unwrap_or(if legacy { "values" } else { "edge_cases" }) {
+        "edge_cases" | "schema_valid" => JsonMutatorMode::EdgeCases,
+        "unconstrained" => JsonMutatorMode::Unconstrained,
+        "schema" => JsonMutatorMode::Schema,
+        "values" => JsonMutatorMode::Values,
+        "absent" => JsonMutatorMode::Absent,
+        "alphanum" | "alphanumeric" if raw.length.is_none() => JsonMutatorMode::Alphanumeric,
+        _ => JsonMutatorMode::Text(resolve_text_generator(raw, operation)?),
+    };
+    let mut field_schemas = HashMap::new();
+    for field in &fields {
+        match parameter_schema(operation, field) {
+            Some(schema) => {
+                field_schemas.insert(field.selector(), schema);
+            }
+            None if mode == JsonMutatorMode::Schema => {
+                return Err(format!(
+                    "mode: schema needs '{}' declared as a parameter of '{}'",
+                    field.selector(),
+                    operation.label()
+                ));
+            }
+            None => {}
+        }
+    }
+    let values = raw
+        .values
+        .iter()
+        .flatten()
+        .map(|value| match value {
+            Value::String(text) => Ok(text.clone()),
+            other => Err(format!("{} values must be strings, found {other}", raw.r#use)),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(MutatorDecl::Http { fields, mode, values, field_schemas })
+}
+
+/// `use: malform`: `mode: catalog` (the default) with an optional `only`.
+fn resolve_malform(raw: &crate::config::RawMutator) -> Result<MutatorDecl, String> {
+    use crate::adapters::http_raw::Malformation;
+    match raw.mode.as_deref().unwrap_or("catalog") {
+        "catalog" => {}
+        "random" => return Err("malform mode: random is available in a later phase; use mode: catalog".into()),
+        other => return Err(format!("unknown malform mode '{other}' (expected catalog)")),
+    }
+    if raw.fields.is_some() || raw.values.is_some() || raw.length.is_some() {
+        return Err("use: malform takes only mode and only".into());
+    }
+    let malformations = match &raw.only {
+        None => Malformation::ALL.to_vec(),
+        Some(names) if names.is_empty() => return Err("malform only must list at least one name".into()),
+        Some(names) => names
+            .iter()
+            .map(|name| {
+                Malformation::from_name(name).ok_or_else(|| {
+                    let known: Vec<&str> = Malformation::ALL.iter().map(|known| known.name()).collect();
+                    format!("unknown malformation '{name}' (expected one of: {})", known.join(", "))
+                })
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(MutatorDecl::Malform { malformations })
+}
+
+/// The OpenAPI schema of a header or path parameter.
+fn parameter_schema(operation: &ResolvedOperation, field: &HttpField) -> Option<FieldSchema> {
+    let param = match field {
+        HttpField::Header(name) => operation
+            .header_params
+            .iter()
+            .find(|param| param.name.eq_ignore_ascii_case(name)),
+        HttpField::Path(name) => operation.path_params.iter().find(|param| &param.name == name),
+    }?;
+    // A template-only path parameter has no schema to derive cases from.
+    let declared = param.schema_json.as_object().is_some_and(|schema| !schema.is_empty());
+    declared.then(|| FieldSchema { schema: param.schema_json.clone(), required: param.required })
+}
+
+fn text_field(raw: &crate::config::RawMutator) -> Result<&str, String> {
+    match raw.fields.as_deref() {
+        Some([field]) if field.split('.').all(|segment| !segment.is_empty()) => Ok(field),
+        _ => Err("text length policies and corpus mutators require exactly one field".into()),
+    }
+}
+
+fn resolve_text_generator(
+    raw: &crate::config::RawMutator,
+    operation: &ResolvedOperation,
+) -> Result<crate::mutation::text::TextGenerator, String> {
+    use crate::mutation::text::{Alphabet, TextGenerator, MAX_TEXT_CHARS};
+    let field = text_field(raw)?;
+    let http_field = (raw.r#use == "http").then(|| HttpField::parse(field)).flatten();
+    let alphabet = match raw.mode.as_deref() {
+        Some("alpha") => Alphabet::Alpha,
+        None | Some("alphanum" | "alphanumeric") => Alphabet::Alphanum,
+        // Headers cannot carry control characters.
+        Some("raw") if http_field.as_ref().is_some_and(HttpField::is_header) => Alphabet::HeaderRaw,
+        Some("raw") => Alphabet::Raw,
+        Some(_) => return Err("text corpus mode must be alpha, alphanum or raw".into()),
+    };
+    let max = raw.length.as_ref().and_then(|length| length.max).unwrap_or(256);
+    let (below, above) = if let Some(reference) = raw.length.as_ref().and_then(|length| length.reference) {
+        (reference, reference)
+    } else {
+        let schema = match &http_field {
+            Some(http_field) => parameter_schema(operation, http_field),
+            None => operation.request_body.as_ref().and_then(|body| field_schema(&body.schema.0, field)),
+        };
+        let bound = |key| {
+            schema.as_ref()?.schema.get(key)?.as_u64().and_then(|value| usize::try_from(value).ok())
+        };
+        bound("minLength").zip(bound("maxLength"))
+            .ok_or_else(|| format!(
+                "field '{field}' with mode: {} needs length: {{reference: N}} \
+                 (its schema does not declare both minLength and maxLength)",
+                raw.mode.as_deref().unwrap_or("alphanum")
+            ))?
+    };
+    if below == 0 || below > above || above >= max || max > MAX_TEXT_CHARS {
+        return Err(format!("field '{field}' requires 0 < lower bound <= upper bound < length.max <= {MAX_TEXT_CHARS}"));
+    }
+    Ok(TextGenerator { alphabet, below, above, max })
+}
+
+fn resolve_corpus(
+    raw: &crate::config::RawMutator,
+    operation: &ResolvedOperation,
+    directory: &Path,
+) -> Result<crate::mutation::text::Corpus, String> {
+    let field = text_field(raw)?;
+    if !operation.request_body.as_ref().is_some_and(|body| body.content_type == "application/json") {
+        return Err("corpus mutators require an application/json request body".into());
+    }
+    if raw.values.is_some() {
+        return Err("corpus mutators read values from their file".into());
+    }
+    let path = raw.path.as_deref().filter(|path| !path.is_empty())
+        .ok_or("corpus mutators require path")?;
+    let repetitions = raw.repetitions.filter(|count| *count > 0)
+        .ok_or("corpus mutators require positive repetitions")?;
+    let generator = if raw.r#use == "file_fuzz" {
+        let seed = raw.seed.filter(|seed| *seed != 0).ok_or("file_fuzz requires a nonzero seed")?;
+        Some((resolve_text_generator(raw, operation)?, seed))
+    } else {
+        if raw.length.is_some() || raw.mode.is_some() || raw.seed.is_some() {
+            return Err("file sends each line unchanged; generation options belong to file_fuzz".into());
+        }
+        None
+    };
+    crate::mutation::text::Corpus::load(&directory.join(path), field.into(), repetitions, generator)
+        .map_err(|error| format!("corpus '{path}': {error}"))
 }
 
 /// Find a dotted field (`metadata.source`) in a resolved request schema by
@@ -732,36 +1062,164 @@ fn field_schema(body_schema: &Value, path: &str) -> Option<FieldSchema> {
 
 // ── Examples ────────────────────────────────────────────────────────
 
-use crate::experiment::types::ExampleCase;
+use crate::experiment::types::{ExampleAction, ExampleCase, JsonExample, JsonSyntaxFixture};
 
-fn resolve_examples(raw_step: &RawStep) -> Result<Vec<ExampleCase>, ResolutionError> {
-    let raw_examples = match &raw_step.cases {
-        Some(cases) => &cases.examples,
-        None => return Ok(Vec::new()),
+fn resolve_examples(
+    raw_step: &RawStep,
+    operation: &ResolvedOperation,
+    bindings: &[Binding],
+) -> Result<(Vec<ExampleCase>, Vec<crate::mutation::fuzz::KeyMutator>), ResolutionError> {
+    let Some(cases) = &raw_step.cases else {
+        return Ok((Vec::new(), Vec::new()));
     };
+    let invalid = |detail| ResolutionError::UnsupportedConstruct {
+        step_id: raw_step.id.clone(),
+        detail,
+    };
+    let has_json_body = operation.request_body.as_ref()
+        .is_some_and(|body| body.content_type == "application/json");
+    let mut examples = Vec::new();
+    let mut key_mutators = Vec::new();
+    let mut seen_ids = HashSet::new();
 
-    // Detect duplicate example IDs
-    let mut seen_ids: HashSet<&str> = HashSet::new();
-    for raw in raw_examples {
-        if !seen_ids.insert(&raw.id) {
-            return Err(ResolutionError::UnsupportedConstruct {
-                step_id: raw_step.id.clone(),
-                detail: format!("duplicate example id '{}'", raw.id),
-            });
+    for raw in &cases.examples {
+        let action = match (&raw.field, &raw.value, raw.syntax.as_deref()) {
+            (Some(path), Some(value), None) => ExampleAction::Field {
+                path: path.clone(),
+                value: value.clone(),
+            },
+            (None, None, Some(syntax)) => {
+                if !has_json_body || !(400..500).contains(&raw.expect_status) {
+                    return Err(invalid(format!(
+                        "syntax example '{}' requires a JSON request body and a 4xx expect_status",
+                        raw.id,
+                    )));
+                }
+                let fixture = match syntax {
+                    "incomplete_object" => JsonSyntaxFixture::IncompleteObject,
+                    "trailing_comma" => JsonSyntaxFixture::TrailingComma,
+                    "leading_text" => JsonSyntaxFixture::LeadingText,
+                    "trailing_text" => JsonSyntaxFixture::TrailingText,
+                    _ => return Err(invalid(format!("unknown JSON syntax fixture '{syntax}'"))),
+                };
+                ExampleAction::Json(JsonExample::Syntax { fixture })
+            }
+            _ => return Err(invalid(format!(
+                "example '{}' requires field and value, or syntax",
+                raw.id,
+            ))),
+        };
+        if !seen_ids.insert(raw.id.clone()) {
+            return Err(invalid(format!("duplicate example id '{}'", raw.id)));
         }
+        examples.push(ExampleCase { id: raw.id.clone(), action, expect_status: raw.expect_status });
     }
 
-    raw_examples
-        .iter()
-        .map(|raw| {
-            Ok(ExampleCase {
-                id: raw.id.clone(),
-                field: raw.field.clone(),
-                value: raw.value.clone(),
-                expect_status: raw.expect_status,
-            })
-        })
-        .collect()
+    for raw in &cases.mutators {
+        if raw.keys.is_none() && raw.rename_to.is_none() {
+            continue;
+        }
+        if raw.length.is_some() {
+            return Err(invalid(
+                "length does not apply to key renames (generated names have 4 to 24 characters)".into(),
+            ));
+        }
+        if raw.r#use != "json" || raw.fields.is_some() || raw.values.is_some()
+            || raw.path.is_some() || raw.repetitions.is_some() || raw.seed.is_some()
+        {
+            return Err(invalid("keys require a dedicated use: json mutator".into()));
+        }
+        if !has_json_body {
+            return Err(invalid("key renames require an application/json request body".into()));
+        }
+        let keys = raw.keys.as_deref().filter(|keys| !keys.is_empty())
+            .ok_or_else(|| invalid("key renames require a nonempty keys list".into()))?;
+        let expected = match raw.expect_status {
+            Some(status) if !(100..=599).contains(&status) => {
+                return Err(invalid("key renames require a valid expect_status".into()));
+            }
+            status => status,
+        };
+        let body = contract::request_body_with_example(operation, bindings, raw_step.body_example.as_ref());
+        let ensure_unbound = |path: &str| {
+            if bindings.iter().any(|binding| matches!(
+                &binding.selector, selectors::InputSelector::BodyField(parts)
+                    if parts.iter().zip(path.split('.')).all(|(bound, part)| bound == part)
+            )) {
+                return Err(invalid(format!("key rename overlaps bound path '{path}'")));
+            }
+            Ok(())
+        };
+        for key in keys {
+            if key.split('.').any(str::is_empty) {
+                return Err(invalid(format!("invalid key path '{key}'")));
+            }
+            ensure_unbound(key)?;
+            let (parent, source) = match key.rsplit_once('.') {
+                Some((path, source)) => (crate::formats::json::get_object_path(&body, path), source),
+                None => (Some(&body), key.as_str()),
+            };
+            let object = parent.and_then(Value::as_object)
+                .ok_or_else(|| invalid(format!("cannot rename '{key}': key parent is not an object")))?;
+            if !object.contains_key(source) {
+                return Err(invalid(format!("cannot rename '{key}': source key is missing")));
+            }
+            let Some(destinations) = &raw.rename_to else {
+                use crate::mutation::text::Alphabet;
+                let alphabet = match raw.mode.as_deref() {
+                    Some("alpha") => Alphabet::Alpha,
+                    Some("alphanum" | "alphanumeric") => Alphabet::Alphanum,
+                    Some("raw") => Alphabet::Raw,
+                    Some(other) => return Err(invalid(format!(
+                        "generated key renames require mode: alpha, alphanum or raw (found mode: {other})"
+                    ))),
+                    None => return Err(invalid(
+                        "key renames need mode: alpha, alphanum or raw, or rename_to with expect_status".into(),
+                    )),
+                };
+                key_mutators.push(crate::mutation::fuzz::KeyMutator {
+                    key: key.clone(),
+                    alphabet,
+                    sibling_names: object.keys().cloned().collect(),
+                    expect_status: expected,
+                });
+                continue;
+            };
+            if raw.mode.is_some() || destinations.is_empty() {
+                return Err(invalid("fixed rename_to requires a nonempty list and no mode".into()));
+            }
+            let expected = expected
+                .ok_or_else(|| invalid("fixed renames require expect_status".into()))?;
+            for destination in destinations {
+                if destination.is_empty() || !destination.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                }) {
+                    return Err(invalid(format!("invalid rename destination '{destination}'")));
+                }
+                let destination_path = match key.rsplit_once('.') {
+                    Some((parent, _)) => format!("{parent}.{destination}"),
+                    None => destination.clone(),
+                };
+                ensure_unbound(&destination_path)?;
+                if object.contains_key(destination) {
+                    return Err(invalid(format!("cannot rename '{key}' to '{destination}': destination key already exists")));
+                }
+                let id = format!("rename:{key}->{destination}");
+                if !seen_ids.insert(id.clone()) {
+                    return Err(invalid(format!("duplicate example id '{id}'")));
+                }
+                examples.push(ExampleCase {
+                    id,
+                    action: ExampleAction::Json(JsonExample::Rename {
+                        key: key.clone(),
+                        destination: destination.clone(),
+                    }),
+                    expect_status: expected,
+                });
+            }
+        }
+    }
+    Ok((examples, key_mutators))
 }
 
 // ── Reference validation ────────────────────────────────────────────
@@ -853,7 +1311,7 @@ mod tests {
         // Step 0: login
         let login = &exp.steps[0];
         assert_eq!(login.id, "login");
-        assert_eq!(login.operation_id, "login");
+        assert_eq!(login.operation_key, "/login.POST");
         assert_eq!(login.bindings.len(), 2);
         assert_eq!(login.outputs.len(), 1);
         assert_eq!(login.outputs[0].name, "token");
@@ -899,10 +1357,10 @@ mod tests {
         ));
 
         let probe = &exp.steps[0];
-        assert_eq!(probe.operation_id, "probeString");
+        assert_eq!(probe.operation_key, "/probe.POST");
         assert!(matches!(
             exp.exploration.strategy,
-            ExplorationStrategy::Fuzz { duration_s: 5, max_execs: 2000, seed: Some(1) }
+            ExplorationStrategy::Fuzz { duration_s: 5, max_execs: 2000, seed: Some(1), max_fields: None }
         ));
         assert!(matches!(
             probe.mutators.as_slice(),
@@ -918,19 +1376,25 @@ mod tests {
             max_cases: 4,
             exploration: None,
             target: None,
-            adapters: config::RawAdapters { http: None },
+            protocols: config::RawProtocols { http: None },
             steps: vec![],
+            hidden: None,
         };
 
         block.steps.push(RawStep {
             id: "s1".into(),
-            adapter: "http".into(),
-            operation_id: "nonexistent".into(),
+            protocol: "http".into(),
+            format: None,
+            operation_id: Some("nonexistent".into()),
+            operation_path: None,
+            body_example: None,
             bind: None,
             auth: None,
             outputs: None,
             cases: None,
             oracles: vec![],
+            print: None,
+            debug: None,
         });
 
         let raw = RawExperiment {
@@ -985,28 +1449,32 @@ mod tests {
 
     #[test]
     fn test_rejects_auth_on_unsecured_op() {
-        use crate::config::RawHttpAdapter;
+        use crate::config::RawHttpProtocol;
 
         let mut block = RawExperimentBlock {
             name: "test".into(),
             max_cases: 4,
             exploration: None,
             target: None,
-            adapters: config::RawAdapters {
-                http: Some(RawHttpAdapter {
+            protocols: config::RawProtocols {
+                http: Some(RawHttpProtocol {
                     base_url: "http://127.0.0.1:8080".into(),
                     openapi: "./openapi.yaml".into(),
                     timeout_ms: 2000,
                 }),
             },
             steps: vec![],
+            hidden: None,
         };
 
         // login has no security requirements (it's the auth endpoint)
         block.steps.push(RawStep {
             id: "s1".into(),
-            adapter: "http".into(),
-            operation_id: "login".into(),
+            protocol: "http".into(),
+            format: None,
+            operation_id: Some("login".into()),
+            operation_path: None,
+            body_example: None,
             bind: None,
             auth: Some(config::RawAuth {
                 bearer: "${env.TOKEN}".into(),
@@ -1014,6 +1482,8 @@ mod tests {
             outputs: None,
             cases: None,
             oracles: vec![],
+            print: None,
+            debug: None,
         });
 
         let raw = RawExperiment {

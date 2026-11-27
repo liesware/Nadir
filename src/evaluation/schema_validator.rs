@@ -1,32 +1,8 @@
-//! JSON Schema validator wrapping `jsonschema` Draft 2020-12.
-//!
-//! # Design notes
-//!
-//! **Chosen:** `SchemaValidator` compiles schemas during static preparation and
-//! validates instances against them. External `$ref` resolution (file and
-//! network) is disabled at the crate-feature level. All schemas passed in
-//! are already resolved by Nadir's contract loader.
-//!
-//! **DESIGN-04:** the validation library is hidden behind this module.
-//! Callers see only Nadir types — `jsonschema` never leaks out.
-//!
-//! **Alternative considered:** extending the existing `CompiledJsonSchema` in
-//! the contract module with validation methods. Rejected because validation
-//! belongs in evaluation, not contract loading.
+//! Prepared response checks indexed by OpenAPI operation and HTTP status.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use jsonschema::{Draft, ValidationOptions, Validator};
-use serde_json::Value;
-
-/// A compiled JSON Schema validator.
-///
-/// Compile once per OpenAPI response schema; validate many instances.
-#[derive(Debug, Clone)]
-pub struct SchemaValidator {
-    compiled: Arc<Validator>,
-}
+pub use crate::formats::json::{SchemaValidationError, SchemaValidator};
 
 /// One entry per declared exact status of an operation using the schema oracle.
 pub type SchemaValidatorCache = HashMap<String, HashMap<u16, ResponseCheck>>;
@@ -56,16 +32,16 @@ pub fn build_schema_cache(
             .iter()
             .any(|oracle| oracle.oracle_type == OracleType::OpenApiSchema)
     }) {
-        if cache.contains_key(&step.operation_id) {
+        if cache.contains_key(&step.operation_key) {
             continue;
         }
         let error = |status, reason| SchemaPreparationError {
-            operation: step.operation_id.clone(),
+            operation: step.operation_key.clone(),
             status,
             reason,
         };
         let contract = experiment
-            .adapters
+            .protocols
             .http
             .as_ref()
             .and_then(|adapter| contracts.get(&adapter.openapi_path))
@@ -77,8 +53,7 @@ pub fn build_schema_cache(
             ));
         }
         let operation = contract
-            .operations
-            .get(&step.operation_id)
+            .operation(&step.operation_key)
             .ok_or_else(|| error(None, "OpenAPI operation is unavailable".into()))?;
         let mut checks = HashMap::new();
         for (&status, response) in operation
@@ -110,142 +85,7 @@ pub fn build_schema_cache(
                 "openapi_schema requires at least one exact response status".into(),
             ));
         }
-        cache.insert(step.operation_id.clone(), checks);
+        cache.insert(step.operation_key.clone(), checks);
     }
     Ok(cache)
-}
-
-/// Schema diagnostics carry paths from the schema, never values from an instance.
-#[derive(Debug, Clone)]
-pub enum SchemaValidationError {
-    InvalidSchema(String),
-    InstanceError(String),
-}
-
-impl SchemaValidationError {
-    pub fn location(&self) -> &str {
-        let path = match self {
-            Self::InvalidSchema(path) | Self::InstanceError(path) => path,
-        };
-        if path.is_empty() {
-            "/"
-        } else {
-            path
-        }
-    }
-}
-
-impl SchemaValidator {
-    /// Compile a JSON Schema value into a reusable validator.
-    ///
-    /// The schema must be a fully resolved JSON Schema object (all `$ref`s
-    /// already inlined by the contract loader). Draft 2020-12 is used and
-    /// external resolution is disabled.
-    pub fn compile(schema: &Value) -> Result<Self, SchemaValidationError> {
-        let compiled = ValidationOptions::default()
-            .with_draft(Draft::Draft202012)
-            .should_validate_formats(false)
-            .build(schema)
-            .map_err(|error| {
-                SchemaValidationError::InvalidSchema(error.instance_path.to_string())
-            })?;
-        Ok(Self {
-            compiled: Arc::new(compiled),
-        })
-    }
-
-    /// Validate a JSON instance against the compiled schema.
-    ///
-    /// Returns the schema location of the first violation without including the instance value.
-    pub fn validate(&self, instance: &Value) -> Result<(), SchemaValidationError> {
-        match self.compiled.iter_errors(instance).next() {
-            Some(error) => Err(SchemaValidationError::InstanceError(
-                error.schema_path.to_string(),
-            )),
-            None => Ok(()),
-        }
-    }
-}
-
-// ── Tests ──────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_compile_valid_schema() {
-        let schema = json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string", "minLength": 1 }
-            }
-        });
-        let validator = SchemaValidator::compile(&schema);
-        assert!(validator.is_ok());
-    }
-
-    #[test]
-    fn test_compile_invalid_schema_rejected() {
-        // A schema with an invalid keyword
-        let schema = json!({
-            "type": "nonexistent_type"
-        });
-        let result = SchemaValidator::compile(&schema);
-        assert!(result.is_err());
-        match result {
-            Err(SchemaValidationError::InvalidSchema(_)) => {}
-            _ => panic!("expected InvalidSchema"),
-        }
-    }
-
-    #[test]
-    fn test_validation_pass() {
-        let schema = json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string", "minLength": 1 }
-            }
-        });
-        let validator = SchemaValidator::compile(&schema).unwrap();
-        let instance = json!({"name": "test"});
-        assert!(validator.validate(&instance).is_ok());
-    }
-
-    #[test]
-    fn test_validation_fail_wrong_type() {
-        let schema = json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string" }
-            }
-        });
-        let validator = SchemaValidator::compile(&schema).unwrap();
-        let instance = json!({"name": 42});
-        let result = validator.validate(&instance);
-        assert!(result.is_err());
-        match result {
-            Err(SchemaValidationError::InstanceError(_)) => {}
-            _ => panic!("expected InstanceError"),
-        }
-    }
-
-    #[test]
-    fn test_validation_fail_missing_required() {
-        let schema = json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string" }
-            }
-        });
-        let validator = SchemaValidator::compile(&schema).unwrap();
-        let instance = json!({});
-        let result = validator.validate(&instance);
-        assert!(result.is_err());
-    }
 }

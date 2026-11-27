@@ -16,9 +16,10 @@ use crate::evaluation::case::{EvaluatedCase, ExecutedPlan};
 use crate::execution::runner::{RunError, WorkflowRunner};
 use crate::experiment::types::Experiment;
 use crate::exploration::budget::{RunBudget, RunStopReason};
-use crate::exploration::enumerate::{collect_findings, record_process_exit};
+use crate::exploration::enumerate::{collect_findings, record_process_exit, report_case, unless_stopped};
 use crate::finding::DedupMap;
-use crate::mutation::fuzz::generate_case;
+use crate::experiment::types::ExplorationStrategy;
+use crate::mutation::fuzz::{generate_case_with, GeneratorVersion};
 
 /// Most random cases kept as evidence in one run.
 const MAX_KEPT_CASES: usize = 200;
@@ -39,6 +40,8 @@ pub struct FuzzSummary {
 
 /// Run random cases, appending the kept ones to `cases`. Returns the reason
 /// the phase stopped (`None` when the experiment has nothing to mutate).
+// The phase shares the enumeration's state and reports through two callbacks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_random_phase(
     runner: &mut WorkflowRunner,
     experiment: &Experiment,
@@ -46,13 +49,19 @@ pub(crate) fn run_random_phase(
     seed: u64,
     findings: &mut DedupMap,
     cases: &mut Vec<EvaluatedCase>,
+    on_progress: &mut impl FnMut(&FuzzSummary, usize),
+    on_case_evidence: &mut impl FnMut(&EvaluatedCase, u32, bool),
 ) -> Result<(Option<RunStopReason>, FuzzSummary), RunError> {
-    let contract = runner.http_contract().cloned();
     let mut summary = FuzzSummary {
         seed,
         executed: 0,
         kept: 0,
         incomplete: 0,
+    };
+    on_progress(&summary, findings.len());
+    let max_fields = match experiment.exploration.strategy {
+        ExplorationStrategy::Fuzz { max_fields, .. } => max_fields,
+        ExplorationStrategy::Enumerate => None,
     };
     let mut kept_per_rule: HashMap<(String, String, String), u32> = HashMap::new();
 
@@ -63,13 +72,19 @@ pub(crate) fn run_random_phase(
         if budget.execs_exhausted() {
             return Ok((Some(RunStopReason::MaxExecsReached), summary));
         }
-        let Some(case) = generate_case(experiment, contract.as_ref(), seed, summary.executed)
+        let Some(case) = generate_case_with(
+            experiment, |step, selector| runner.baseline_value(step, selector), seed, summary.executed,
+            GeneratorVersion::CURRENT, max_fields,
+        )
         else {
             return Ok((None, summary));
         };
-        let execution = runner.execute_replacements(&case.step_id, &case.replacements)?;
+        let Some(execution) = unless_stopped(runner.execute_fuzz_case(&case))? else {
+            return Ok((Some(RunStopReason::StoppedByUser), summary));
+        };
         budget.record_request();
-        let evaluated = EvaluatedCase::new(
+        let key_expectation = case.key_rename.as_ref().and_then(|rename| rename.expectation());
+        let mut evaluated = EvaluatedCase::new(
             experiment,
             execution,
             ExecutedPlan::Fuzz {
@@ -77,15 +92,21 @@ pub(crate) fn run_random_phase(
                 replacements: case.replacements,
                 seed,
                 iteration: summary.executed,
+                generator: GeneratorVersion::CURRENT.number(),
+                max_fields,
+                key_expectation,
             },
             &runner.schema_cache,
         );
         summary.executed += 1;
         collect_findings(findings, &evaluated, runner);
 
-        if record_process_exit(findings, &evaluated, runner) {
+        if let Some(diagnostic) = record_process_exit(findings, &evaluated, runner) {
+            evaluated.process_exit = Some(diagnostic);
             summary.kept += 1;
+            report_case(on_case_evidence, &evaluated, cases.len() as u32 + 1, true);
             cases.push(evaluated);
+            on_progress(&summary, findings.len());
             return Ok((Some(RunStopReason::ProcessExit), summary));
         }
 
@@ -100,21 +121,26 @@ pub(crate) fn run_random_phase(
             })
             .collect();
         if rules.is_empty() {
+            report_case(on_case_evidence, &evaluated, cases.len() as u32 + 1, false);
             if evaluated.is_incomplete() {
                 summary.incomplete += 1;
             }
+            on_progress(&summary, findings.len());
             continue;
         }
         let new_evidence = rules
             .iter()
             .any(|rule| kept_per_rule.get(rule).copied().unwrap_or(0) < KEPT_PER_RULE);
-        if new_evidence && summary.kept < MAX_KEPT_CASES {
+        let retain = new_evidence && summary.kept < MAX_KEPT_CASES;
+        report_case(on_case_evidence, &evaluated, cases.len() as u32 + 1, retain);
+        if retain {
             for rule in rules {
                 *kept_per_rule.entry(rule).or_default() += 1;
             }
             summary.kept += 1;
             cases.push(evaluated);
         }
+        on_progress(&summary, findings.len());
     }
 }
 

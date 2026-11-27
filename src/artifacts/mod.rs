@@ -46,11 +46,21 @@ pub struct FuzzRecord {
     pub incomplete: u64,
 }
 
-/// Identifies a random case; replay regenerates it from these two numbers.
+/// Identifies a random case; replay regenerates it from these numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzCaseRef {
     pub seed: u64,
     pub iteration: u64,
+    /// The rule that built the case; records without it predate rule 2.
+    #[serde(default = "first_generator")]
+    pub generator: u32,
+    /// `exploration.max_fields` when the case ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fields: Option<u16>,
+}
+
+fn first_generator() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,9 +77,22 @@ pub struct RunCounters {
     pub requests_sent: u32,
     pub findings_count: u32,
     pub discards_count: u32,
+    #[serde(default)]
+    pub transport_errors: u64,
 }
 
 // ── Case record ────────────────────────────────────────────────────
+
+/// Diagnostic data recorded when the monitored target exited during a case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessExitDiagnostic {
+    /// The step that was executing when the target exited.
+    pub step_id: String,
+    /// Target exit code, when known.
+    pub exit_code: Option<i32>,
+    /// Termination signal, when known.
+    pub signal: Option<i32>,
+}
 
 /// Stored representation of a single case execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +104,9 @@ pub struct CaseRecord {
     pub coverage_snapshot_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regression_plan: Option<RegressionPlan>,
+    /// Present when the target process exited during this case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_exit: Option<ProcessExitDiagnostic>,
 }
 
 /// Portable regression recipe for the experiment that produced this record.
@@ -99,6 +125,20 @@ pub struct RegressionPlan {
     /// When this is a random case, its seed and iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzz: Option<FuzzCaseRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus: Option<crate::mutation::text::CorpusCaseRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_example: Option<crate::experiment::types::JsonExample>,
+    /// When this is a `malform` case, the step and the malformation name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub malform: Option<MalformRef>,
+}
+
+/// Identifies a `malform` case; replay rebuilds its bytes from the name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MalformRef {
+    pub step_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +248,7 @@ impl RunRecord {
                 requests_sent: 0,
                 findings_count: 0,
                 discards_count: 0,
+                transport_errors: 0,
             },
             target_state_policy: "best_effort".into(),
             stop_reason: format!("{:?}", stop_reason),
@@ -227,6 +268,9 @@ impl RunRecord {
 
 impl CaseRecord {
     pub const CURRENT_VERSION: u32 = 2;
+    pub(crate) const CORPUS_VERSION: u32 = 3;
+    pub(crate) const JSON_EXAMPLE_VERSION: u32 = 4;
+    pub(crate) const MALFORM_VERSION: u32 = 5;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -268,9 +312,50 @@ mod tests {
             step_results: vec![],
             coverage_snapshot_sha256: None,
             regression_plan: None,
+            process_exit: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: CaseRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.artifact_version, 1);
+    }
+
+    #[test]
+    fn backward_compat_deserializes_without_process_exit() {
+        // Records predating the `process_exit` field must still deserialize.
+        let json = serde_json::json!({
+            "artifact_version": 2,
+            "case_id": "old-case",
+            "case_number": 42,
+            "step_results": [],
+            "coverage_snapshot_sha256": null
+        });
+        let record: CaseRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(record.case_id, "old-case");
+        assert_eq!(record.case_number, 42);
+        assert!(record.process_exit.is_none(), "missing field defaults to None");
+    }
+
+    #[test]
+    fn process_exit_diagnostic_round_trips() {
+        let diag = ProcessExitDiagnostic {
+            step_id: "sign".into(),
+            exit_code: Some(1),
+            signal: None,
+        };
+        let record = CaseRecord {
+            artifact_version: 2,
+            case_id: "crashed".into(),
+            case_number: 0,
+            step_results: vec![],
+            coverage_snapshot_sha256: None,
+            regression_plan: None,
+            process_exit: Some(diag),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: CaseRecord = serde_json::from_str(&json).unwrap();
+        let diag = parsed.process_exit.unwrap();
+        assert_eq!(diag.step_id, "sign");
+        assert_eq!(diag.exit_code, Some(1));
+        assert_eq!(diag.signal, None);
     }
 }

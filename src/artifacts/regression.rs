@@ -6,6 +6,7 @@ use crate::evaluation::{resolve_expectation, Verdict};
 use crate::execution::runner::StepOutcome;
 use crate::experiment::selectors::{JsonPathSegment, ObservationSelector};
 use crate::experiment::types::{ExpectCondition, Experiment};
+use crate::inspect::HIDDEN_PLACEHOLDER;
 use crate::observation::SelectedValue;
 
 pub(crate) fn regression_record<'a>(
@@ -44,7 +45,7 @@ pub(crate) fn regression_record<'a>(
                     if step
                         .observation
                         .as_ref()
-                        .is_some_and(|observation| observation.truncated) =>
+                        .is_some_and(|observation| observation.is_truncated()) =>
                 {
                     "response_limit"
                 }
@@ -72,7 +73,8 @@ pub(crate) fn regression_record<'a>(
                         observed = step
                             .observation
                             .as_ref()
-                            .map(|value| format!("HTTP {}", value.status));
+                            .and_then(|observation| observation.http_status())
+                            .map(|status| format!("HTTP {status}"));
                     }
                     if verdict == "fail"
                         || verdict == "inconclusive"
@@ -99,12 +101,9 @@ pub(crate) fn regression_record<'a>(
                                         && case.step_results.iter().any(|step| {
                                             &step.step_id == source && step.sensitive_response
                                         });
-                                if is_secret
-                                    || sensitive_response_data
-                                    || sensitive_selector(selector)
-                                {
-                                    expected = Some("[redacted]".into());
-                                    observed = Some("[redacted]".into());
+                                if is_secret || sensitive_response_data {
+                                    expected = Some(HIDDEN_PLACEHOLDER.into());
+                                    observed = Some(HIDDEN_PLACEHOLDER.into());
                                 } else {
                                     expected = Some(match expect {
                                         ExpectCondition::Equals(value) => diagnostic_value(
@@ -123,6 +122,9 @@ pub(crate) fn regression_record<'a>(
                                             .join(" or "),
                                         ExpectCondition::Exists => "present".into(),
                                         ExpectCondition::Rejected => "rejection (status >= 400)".into(),
+                                        ExpectCondition::Handled => {
+                                            "an answer without a 5xx, or a closed connection, before the timeout".into()
+                                        }
                                         ExpectCondition::Absent => "absent".into(),
                                     });
                                     observed = match &check.evaluation.observed {
@@ -183,7 +185,7 @@ pub(crate) fn regression_record<'a>(
             StepResultRecord {
                 step_id: step.step_id.clone(),
                 outcome: outcome.into(),
-                status: step.observation.as_ref().map(|response| response.status),
+                status: step.observation.as_ref().and_then(|observation| observation.http_status()),
                 body_sha256: None,
                 extracted_outputs: Default::default(),
                 oracle_verdicts,
@@ -194,12 +196,19 @@ pub(crate) fn regression_record<'a>(
         .collect();
 
     CaseRecord {
-        artifact_version: CaseRecord::CURRENT_VERSION,
+        artifact_version: match evaluated.plan {
+            crate::evaluation::case::ExecutedPlan::Corpus(_) => CaseRecord::CORPUS_VERSION,
+            crate::evaluation::case::ExecutedPlan::Malform { .. } => CaseRecord::MALFORM_VERSION,
+            crate::evaluation::case::ExecutedPlan::Example { json_example: Some(_), .. } =>
+                CaseRecord::JSON_EXAMPLE_VERSION,
+            _ => CaseRecord::CURRENT_VERSION,
+        },
         case_id: case.case_id.clone(),
         case_number: number,
         step_results,
         coverage_snapshot_sha256: None,
         regression_plan: None,
+        process_exit: evaluated.process_exit.clone(),
     }
 }
 
@@ -233,29 +242,6 @@ fn body_path_starts_with(longer: &[JsonPathSegment], prefix: &[JsonPathSegment])
     longer.len() >= prefix.len() && longer.iter().zip(prefix).all(|(a, b)| a == b)
 }
 
-fn sensitive_selector(selector: &ObservationSelector) -> bool {
-    match selector {
-        ObservationSelector::Status => false,
-        ObservationSelector::Body(path) => path.iter().any(|segment| {
-            let key = segment.as_key().map(|k| k.to_ascii_lowercase());
-            let Some(key) = key else { return false };
-            [
-                "pass",
-                "secret",
-                "token",
-                "auth",
-                "credential",
-                "cookie",
-                "api_key",
-                "apikey",
-            ]
-            .iter()
-            .any(|piece| key.contains(piece))
-        }),
-        _ => true,
-    }
-}
-
 /// `declared status (200, 404), no 5xx, valid JSON`.
 fn openapi_expectation(declared: &[u16]) -> String {
     let statuses = if declared.is_empty() || declared.contains(&0) {
@@ -274,7 +260,7 @@ fn diagnostic_value(value: &serde_json::Value, secrets: &[&str]) -> String {
                 value.as_str() == secret || (secret.len() >= 4 && value.contains(secret))
             }) =>
         {
-            "[redacted]".into()
+            HIDDEN_PLACEHOLDER.into()
         }
         serde_json::Value::String(value) if value.len() > 160 => "[text omitted]".into(),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
