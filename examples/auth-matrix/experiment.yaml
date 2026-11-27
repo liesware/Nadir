@@ -1,0 +1,134 @@
+version: 1
+
+experiment:
+  name: auth-matrix
+  max_cases: 4
+  exploration:
+    strategy: enumerate
+
+  # Nadir starts the fixture API with the role policy under test and stops it
+  # at the end. NADIR_FIXTURE_MODE=auth_matrix_open runs a policy that lets
+  # ordinary users create records, which this experiment reports.
+  target:
+    command: ["python3", "-I", "../../tests/fixtures/python_api/server.py",
+              "--port", "${target.port}",
+              "--mode", "${env.NADIR_FIXTURE_MODE:-auth_matrix}"]
+    ready:
+      path: /health
+
+  adapters:
+    http:
+      base_url: http://127.0.0.1:8091
+      openapi: ../create-record/openapi.yaml
+      timeout_ms: 2000
+
+  steps:
+    - id: login_admin
+      adapter: http
+      operation_id: login
+      bind:
+        body.user: "admin"
+        body.pass: "${env.NADIR_ADMIN_PASSWORD:-admin-secret}"
+      outputs:
+        token:
+          from: response.body.access_token
+          when_status: 200
+          secret: true
+      oracles:
+        - use: openapi
+        - id: admin-login-succeeds
+          use: assert
+          setup: true
+          select: response.status
+          expect:
+            equals: 200
+
+    - id: login_user
+      adapter: http
+      operation_id: login
+      bind:
+        body.user: "user"
+        body.pass: "${env.NADIR_USER_PASSWORD:-user-secret}"
+      outputs:
+        token:
+          from: response.body.access_token
+          when_status: 200
+          secret: true
+      oracles:
+        - use: openapi
+        - id: user-login-succeeds
+          use: assert
+          setup: true
+          select: response.status
+          expect:
+            equals: 200
+
+    - id: admin_creates_record
+      adapter: http
+      operation_id: createRecord
+      auth:
+        bearer: "${steps.login_admin.outputs.token}"
+      bind:
+        body.template_id: "tpl-123"
+        body.reference: "${case.id}"
+        body.title: "Admin Record"
+        body.metadata.source: nadir
+      oracles:
+        - use: openapi
+        - id: admin-create-succeeds
+          use: assert
+          select: response.status
+          expect:
+            equals: 201
+
+    - id: user_reads_admin_record
+      adapter: http
+      operation_id: getRecordByReference
+      auth:
+        bearer: "${steps.login_user.outputs.token}"
+      bind:
+        path.reference: "${case.id}"
+      oracles:
+        - use: openapi
+        - id: user-can-read-admin-record
+          use: assert
+          select: response.status
+          expect:
+            equals: 200
+        - id: shared-reference-matches
+          use: assert
+          select: response.body.reference
+          expect:
+            equals: "${case.id}"
+
+    - id: user_tries_create
+      adapter: http
+      operation_id: createRecord
+      auth:
+        bearer: "${steps.login_user.outputs.token}"
+      bind:
+        body.template_id: "tpl-123"
+        body.reference: "${case.id}-user"
+        body.title: "User Record"
+        body.metadata.source: nadir
+      oracles:
+        - use: openapi
+        - id: user-create-rejected
+          use: assert
+          select: response.status
+          expect:
+            equals: 403
+
+    - id: admin_verifies_no_record
+      adapter: http
+      operation_id: getRecordByReference
+      auth:
+        bearer: "${steps.login_admin.outputs.token}"
+      bind:
+        path.reference: "${case.id}-user"
+      oracles:
+        - use: openapi
+        - id: no-record-from-rejected-create
+          use: record_absent
+          kind: security
+          record_reference: response.body.reference

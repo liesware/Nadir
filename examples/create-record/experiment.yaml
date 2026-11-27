@@ -1,0 +1,110 @@
+version: 1
+
+experiment:
+  name: create-record
+  max_cases: 12
+  exploration:
+    strategy: enumerate
+
+  # Nadir starts the bundled fixture API and stops it at the end. Paths are
+  # relative to this file. NADIR_FIXTURE_MODE=title_regression switches on a
+  # deliberate bug (see demo.py --regression).
+  target:
+    command: ["python3", "-I", "../../tests/fixtures/python_api/server.py",
+              "--port", "${target.port}",
+              "--mode", "${env.NADIR_FIXTURE_MODE:-corrected}"]
+    ready:
+      path: /health
+
+  adapters:
+    http:
+      base_url: http://127.0.0.1:8080
+      openapi: ./openapi.yaml
+      timeout_ms: 2000
+
+  steps:
+    - id: login
+      adapter: http
+      operation_id: login
+      bind:
+        body.user: "fixture-user"
+        body.pass: "${env.NADIR_FIXTURE_PASSWORD:-test-password}"
+      outputs:
+        token:
+          from: response.body.access_token
+          when_status: 200
+          secret: true
+      oracles:
+        - use: openapi
+        - id: login-succeeds
+          use: assert
+          setup: true
+          select: response.status
+          expect:
+            equals: 200
+
+    - id: get_template
+      adapter: http
+      operation_id: getTemplate
+      bind:
+        path.id: tpl-123
+      auth:
+        bearer: "${steps.login.outputs.token}"
+      outputs:
+        template_id:
+          from: response.body.id
+          when_status: 200
+      cases:
+        mutators:
+          - use: headers
+            fields: [Accept-Language]
+            values: ["en", "es"]
+      oracles:
+        - use: openapi
+        - id: template-title-preserved
+          use: assert
+          select: response.body.title
+          expect:
+            equals: Invoice Template
+
+    - id: post_record
+      adapter: http
+      operation_id: createRecord
+      auth:
+        bearer: "${steps.login.outputs.token}"
+      bind:
+        body.template_id: "${steps.get_template.outputs.template_id}"
+        body.reference: "${case.id}"
+        body.metadata.source: nadir
+      cases:
+        mutators:
+          - use: json
+            fields: [title]
+            mode: edge_cases
+      oracles:
+        - use: openapi
+
+    - id: verify_record
+      adapter: http
+      operation_id: getRecordByReference
+      auth:
+        bearer: "${steps.login.outputs.token}"
+      bind:
+        path.reference: "${case.id}"
+      oracles:
+        - use: openapi
+        - id: accepted-create-persists
+          use: assert
+          when:
+            select: steps.post_record.response.status
+            equals: 201
+          select: response.body.reference
+          expect:
+            equals: "${case.id}"
+        - id: rejected-create-does-not-persist
+          use: record_absent
+          kind: security
+          when:
+            select: steps.post_record.response.status
+            equals: 422
+          record_reference: response.body.reference

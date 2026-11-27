@@ -1,0 +1,1039 @@
+//! Input mutation: variant enumeration, token dictionary, value generation.
+//!
+//! # Design notes
+//!
+//! **Chosen:** `VariantGenerator::enumerate()` returns a `Vec<CasePlan>` in
+//! canonical order (step declaration → mutator declaration → field byte order).
+//! Each variant replaces exactly one field. Bound fields and duplicate values
+//! are excluded.
+
+pub mod fuzz;
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::adapters::http::contract::{build_baseline_input, ResolvedContract};
+use crate::experiment::types::{
+    Experiment, FieldSchema, JsonMutatorMode, MutatorDecl, ReplacementValue, Step,
+};
+
+// ── Part descriptor ────────────────────────────────────────────────
+
+/// Stable descriptor for one mutable part, computed at resolution time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PartDescriptor {
+    pub step_id: String,
+    /// Canonical selector string (e.g., "body.title", "header.Accept-Language").
+    pub canonical_selector: String,
+    pub input_kind: InputKind,
+    pub representation: ValueRepresentation,
+    pub mutation_mode: Option<JsonMutatorMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputKind {
+    JsonField,
+    HeaderField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueRepresentation {
+    JsonString,
+    HeaderAscii,
+}
+
+// ── Case plan ──────────────────────────────────────────────────────
+
+/// A set of replacements to apply for one case.
+#[derive(Debug, Clone)]
+pub struct CasePlan {
+    /// Descriptors in canonical order (one per mutable part).
+    pub descriptors: Vec<PartDescriptor>,
+    /// Replacements index-aligned with descriptors.
+    /// `None` means "no replacement for this descriptor in this plan."
+    pub replacements: Vec<Option<ReplacementValue>>,
+}
+
+// ── Variant generator ──────────────────────────────────────────────
+
+/// Identifies a configured regression variant without persisting the request value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegressionVariant {
+    pub step_id: String,
+    pub selector: String,
+    #[serde(flatten)]
+    identity: VariantIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum VariantIdentity {
+    Stable { variant_id: VariantId },
+    Legacy { choice: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "option")]
+enum VariantId {
+    Empty,
+    LongLowercase,
+    LongUppercase,
+    Unicode,
+    Reserved,
+    NulByte,
+    HugeUppercase,
+    ScriptTag,
+    SqlQuote,
+    TemplateSyntax,
+    NullString,
+    // `mode: schema`: values derived from the field's request schema.
+    MissingField,
+    NullValue,
+    WrongTypeString,
+    WrongTypeNumber,
+    WrongTypeBoolean,
+    WrongTypeArray,
+    WrongTypeObject,
+    TooShort,
+    AtMaxLength,
+    OverMaxLength,
+    BadFormat,
+    NotInEnum,
+    BelowMinimum,
+    AboveMaximum,
+    Fraction,
+    IntegerOverflow,
+    HugeNumber,
+    NegativeOne,
+    EmptyArray,
+    OverMaxItems,
+    EmptyObject,
+    /// A value from the mutator's `values` list, by position.
+    Custom(usize),
+    Header(usize),
+}
+
+const EDGE_CASES_V1: [VariantId; 5] = [
+    VariantId::Empty,
+    VariantId::LongLowercase,
+    VariantId::LongUppercase,
+    VariantId::Unicode,
+    VariantId::Reserved,
+];
+
+// The historical ordering is reserved for v1 records. V2 resolves names.
+const EDGE_CASES: [VariantId; 5] = [
+    VariantId::Empty,
+    VariantId::LongLowercase,
+    VariantId::LongUppercase,
+    VariantId::Unicode,
+    VariantId::Reserved,
+];
+
+/// The `unconstrained` catalog, in enumeration order. Names (not positions)
+/// identify entries in saved cases.
+const UNCONSTRAINED: [VariantId; 8] = [
+    VariantId::Empty,
+    VariantId::LongLowercase,
+    VariantId::NulByte,
+    VariantId::HugeUppercase,
+    VariantId::ScriptTag,
+    VariantId::SqlQuote,
+    VariantId::TemplateSyntax,
+    VariantId::NullString,
+];
+
+impl VariantId {
+    fn json_value(self) -> Option<ReplacementValue> {
+        let value = match self {
+            Self::Empty => String::new(),
+            Self::LongLowercase => "a".repeat(200),
+            Self::LongUppercase => "A".repeat(200),
+            Self::Unicode => "测试".into(),
+            Self::Reserved => "RESERVED".into(),
+            Self::NulByte => "\u{0000}".into(),
+            Self::HugeUppercase => "A".repeat(65536),
+            Self::ScriptTag => "</script>".into(),
+            Self::SqlQuote => "' OR '1'='1".into(),
+            Self::TemplateSyntax => "${}".into(),
+            Self::NullString => "null".into(),
+            // Schema-derived and custom values depend on the step.
+            _ => return None,
+        };
+        Some(ReplacementValue::JsonString(value))
+    }
+}
+
+/// Longest string `mode: schema` generates for `maxLength` cases.
+const MAX_GENERATED_LENGTH: u64 = 1 << 20;
+/// Largest `maxItems` for which `mode: schema` builds an oversized array.
+const MAX_GENERATED_ITEMS: u64 = 1000;
+
+/// The named values a JSON descriptor enumerates, in order: the mode's
+/// catalog followed by the mutator's custom `values`.
+fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, ReplacementValue)> {
+    let Some(field) = descriptor.canonical_selector.strip_prefix("body.") else {
+        return Vec::new();
+    };
+    for mutator in &step.mutators {
+        let MutatorDecl::Json {
+            fields,
+            mode,
+            values,
+            field_schemas,
+        } = mutator
+        else {
+            continue;
+        };
+        if !fields.iter().flatten().any(|candidate| candidate == field) {
+            continue;
+        }
+        let static_catalog = |catalog: &[VariantId]| -> Vec<(VariantId, ReplacementValue)> {
+            catalog
+                .iter()
+                .filter_map(|id| Some((*id, id.json_value()?)))
+                .collect()
+        };
+        let mut variants = match mode {
+            JsonMutatorMode::EdgeCases => static_catalog(&EDGE_CASES),
+            JsonMutatorMode::Unconstrained => static_catalog(&UNCONSTRAINED),
+            JsonMutatorMode::Schema => field_schemas
+                .get(field)
+                .map(schema_variants)
+                .unwrap_or_default(),
+        };
+        variants.extend(values.iter().enumerate().map(|(index, value)| {
+            let value = match value {
+                Value::String(text) => ReplacementValue::JsonString(text.clone()),
+                other => ReplacementValue::JsonValue(other.clone()),
+            };
+            (VariantId::Custom(index), value)
+        }));
+        return variants;
+    }
+    Vec::new()
+}
+
+/// Values that probe the edges of a field's JSON Schema: a missing required
+/// field, `null`, wrong types, and each declared bound just outside (and,
+/// for `maxLength`, exactly at) its limit.
+fn schema_variants(field: &FieldSchema) -> Vec<(VariantId, ReplacementValue)> {
+    use VariantId::*;
+    let schema = &field.schema;
+    let types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(kind)) => vec![kind.as_str()],
+        Some(Value::Array(kinds)) => kinds.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let has = |kind: &str| types.contains(&kind);
+    let numeric = has("integer") || has("number");
+    let integer_only = has("integer") && !has("number");
+    let json = ReplacementValue::JsonValue;
+    let text = |value: String| ReplacementValue::JsonString(value);
+    let unsigned = |key: &str| schema.get(key).and_then(Value::as_u64);
+
+    let mut out = Vec::new();
+    if field.required {
+        out.push((MissingField, ReplacementValue::Absent));
+    }
+    // Wrong types only make sense when the schema restricts the type.
+    if !types.is_empty() {
+        if !has("null") {
+            out.push((NullValue, json(Value::Null)));
+        }
+        if !has("string") {
+            out.push((WrongTypeString, json(Value::from("nadir"))));
+        }
+        if !numeric {
+            out.push((WrongTypeNumber, json(Value::from(12345))));
+        }
+        if !has("boolean") {
+            out.push((WrongTypeBoolean, json(Value::Bool(true))));
+        }
+        if !has("array") {
+            out.push((WrongTypeArray, json(Value::Array(Vec::new()))));
+        }
+        if !has("object") {
+            out.push((WrongTypeObject, json(Value::Object(Default::default()))));
+        }
+    }
+    if has("string") {
+        if let Some(min) = unsigned("minLength").filter(|min| *min >= 1) {
+            out.push((TooShort, text("a".repeat(min as usize - 1))));
+        }
+        if let Some(max) = unsigned("maxLength").filter(|max| *max < MAX_GENERATED_LENGTH) {
+            out.push((AtMaxLength, text("a".repeat(max as usize))));
+            out.push((OverMaxLength, text("a".repeat(max as usize + 1))));
+        }
+        if let Some(format) = schema.get("format").and_then(Value::as_str) {
+            out.push((BadFormat, text(format!("not-a-valid-{format}"))));
+        }
+    }
+    if numeric {
+        let exclusive_min = schema.get("exclusiveMinimum");
+        let exclusive_max = schema.get("exclusiveMaximum");
+        // OpenAPI 3.1 states exclusive bounds as numbers; 3.0 as booleans.
+        let below = match (exclusive_min.filter(|bound| bound.is_number()), schema.get("minimum")) {
+            (Some(bound), _) => Some(bound.clone()),
+            (None, Some(min)) if exclusive_min == Some(&Value::Bool(true)) => Some(min.clone()),
+            (None, Some(min)) => offset(min, -1),
+            (None, None) => None,
+        };
+        let above = match (exclusive_max.filter(|bound| bound.is_number()), schema.get("maximum")) {
+            (Some(bound), _) => Some(bound.clone()),
+            (None, Some(max)) if exclusive_max == Some(&Value::Bool(true)) => Some(max.clone()),
+            (None, Some(max)) => offset(max, 1),
+            (None, None) => None,
+        };
+        let has_lower_bound = below.is_some();
+        if let Some(value) = below {
+            out.push((BelowMinimum, json(value)));
+        }
+        if let Some(value) = above {
+            out.push((AboveMaximum, json(value)));
+        }
+        if !has_lower_bound {
+            out.push((NegativeOne, json(Value::from(-1))));
+        }
+        if integer_only {
+            out.push((Fraction, json(Value::from(1.5))));
+            out.push((IntegerOverflow, json(Value::from(u64::MAX))));
+        } else {
+            out.push((HugeNumber, json(Value::from(f64::MAX))));
+        }
+    }
+    if has("array") {
+        if unsigned("minItems").is_some_and(|min| min >= 1) {
+            out.push((EmptyArray, json(Value::Array(Vec::new()))));
+        }
+        if let Some(max) = unsigned("maxItems").filter(|max| *max < MAX_GENERATED_ITEMS) {
+            out.push((OverMaxItems, json(Value::Array(vec![Value::Null; max as usize + 1]))));
+        }
+    }
+    if has("object")
+        && schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| !required.is_empty())
+    {
+        out.push((EmptyObject, json(Value::Object(Default::default()))));
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        let outsider = if allowed.iter().all(Value::is_number) {
+            Value::from(987_654_321)
+        } else {
+            Value::from("nadir-not-in-enum")
+        };
+        if !allowed.contains(&outsider) {
+            let value = match outsider {
+                Value::String(outsider) => text(outsider),
+                other => json(other),
+            };
+            out.push((NotInEnum, value));
+        }
+    }
+    out
+}
+
+/// `bound + delta`, keeping integers as integers.
+fn offset(bound: &Value, delta: i64) -> Option<Value> {
+    if let Some(integer) = bound.as_i64() {
+        return Some(Value::from(integer.saturating_add(delta)));
+    }
+    bound.as_f64().map(|float| Value::from(float + delta as f64))
+}
+
+impl RegressionVariant {
+    pub(crate) fn from_replacement(
+        experiment: &Experiment,
+        descriptor: &PartDescriptor,
+        value: &ReplacementValue,
+    ) -> Option<Self> {
+        let step = experiment
+            .steps
+            .iter()
+            .find(|step| step.id == descriptor.step_id)?;
+        let variant_id = match descriptor.input_kind {
+            InputKind::HeaderField => VariantId::Header(
+                enumerate_values_for_descriptor(step, descriptor)
+                    .iter()
+                    .position(|item| item == value)?,
+            ),
+            InputKind::JsonField => json_variants(step, descriptor)
+                .into_iter()
+                .find(|(_, candidate)| candidate == value)?
+                .0,
+        };
+        Some(Self {
+            step_id: descriptor.step_id.clone(),
+            selector: descriptor.canonical_selector.clone(),
+            identity: VariantIdentity::Stable { variant_id },
+        })
+    }
+
+    /// Whether this variant sends a value its field's schema forbids, so the
+    /// service is expected to reject the request.
+    pub(crate) fn expects_rejection(&self) -> bool {
+        use VariantId::*;
+        matches!(
+            self.identity,
+            VariantIdentity::Stable {
+                variant_id: MissingField
+                    | NullValue
+                    | WrongTypeString
+                    | WrongTypeNumber
+                    | WrongTypeBoolean
+                    | WrongTypeArray
+                    | WrongTypeObject
+                    | TooShort
+                    | OverMaxLength
+                    | BadFormat
+                    | NotInEnum
+                    | BelowMinimum
+                    | AboveMaximum
+                    | Fraction
+                    | IntegerOverflow
+                    | HugeNumber
+                    | EmptyArray
+                    | OverMaxItems
+                    | EmptyObject
+            }
+        )
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        experiment: &Experiment,
+        artifact_version: u32,
+    ) -> Option<ReplacementValue> {
+        let step = experiment
+            .steps
+            .iter()
+            .find(|step| step.id == self.step_id)?;
+        build_descriptors(experiment)
+            .into_iter()
+            .filter(|descriptor| {
+                descriptor.step_id == self.step_id && descriptor.canonical_selector == self.selector
+            })
+            .find_map(|descriptor| {
+                let id = match (&self.identity, artifact_version, descriptor.input_kind) {
+                    (VariantIdentity::Stable { variant_id }, 2, _) => *variant_id,
+                    (VariantIdentity::Legacy { choice }, 1, InputKind::HeaderField) => {
+                        VariantId::Header(*choice)
+                    }
+                    (VariantIdentity::Legacy { choice }, 1, InputKind::JsonField) => {
+                        *EDGE_CASES_V1.get(*choice)?
+                    }
+                    _ => return None,
+                };
+                match (descriptor.input_kind, id) {
+                    (InputKind::HeaderField, VariantId::Header(option)) => {
+                        enumerate_values_for_descriptor(step, &descriptor)
+                            .into_iter()
+                            .nth(option)
+                    }
+                    // Only names the step currently enumerates resolve.
+                    (InputKind::JsonField, _) => json_variants(step, &descriptor)
+                        .into_iter()
+                        .find(|(candidate, _)| *candidate == id)
+                        .map(|(_, value)| value),
+                    _ => None,
+                }
+            })
+    }
+}
+
+/// Generates single-field enumeration variants.
+pub struct VariantGenerator;
+
+impl VariantGenerator {
+    /// Generate all single-field variants for an experiment.
+    ///
+    /// The contract provides the values the baseline request sends (the
+    /// operation example plus bindings), used to skip "unchanged" variants.
+    pub fn enumerate(experiment: &Experiment, contract: Option<&ResolvedContract>) -> Vec<CasePlan> {
+        // 1. Build the canonical descriptor list
+        let descriptors = build_descriptors(experiment);
+        if descriptors.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Collect baseline values for each descriptor
+        let baseline_values = collect_baseline_values(experiment, contract, &descriptors);
+
+        // 3. Generate all variant values
+        let mut all_variants: Vec<(usize, ReplacementValue)> = Vec::new();
+        let mut seen: HashSet<(usize, ReplacementValue)> = HashSet::new();
+
+        for (desc_idx, descriptor) in descriptors.iter().enumerate() {
+            let step = experiment
+                .steps
+                .iter()
+                .find(|s| s.id == descriptor.step_id)
+                .expect("descriptor references unknown step");
+
+            let values = enumerate_values_for_descriptor(step, descriptor);
+
+            for value in values {
+                // Skip duplicates
+                if !seen.insert((desc_idx, value.clone())) {
+                    continue;
+                }
+                // Skip unchanged (equals baseline)
+                if let Some(baseline) = baseline_values.get(&desc_idx) {
+                    if *baseline == value {
+                        continue;
+                    }
+                }
+                all_variants.push((desc_idx, value));
+            }
+        }
+
+        // 4. Build case plans: one per variant (single-field replacement)
+        let mut plans = Vec::new();
+        for (desc_idx, value) in all_variants {
+            let mut replacements: Vec<Option<ReplacementValue>> = vec![None; descriptors.len()];
+            replacements[desc_idx] = Some(value);
+
+            plans.push(CasePlan {
+                descriptors: descriptors.clone(),
+                replacements,
+            });
+        }
+
+        plans
+    }
+}
+
+// ── Descriptor construction ────────────────────────────────────────
+
+fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> {
+    let mut descriptors = Vec::new();
+
+    for step in &experiment.steps {
+        // Collect bound field names for this step
+        let bound_fields: HashSet<String> = step
+            .bindings
+            .iter()
+            .filter_map(|b| {
+                if let crate::experiment::selectors::InputSelector::BodyField(path) = &b.selector {
+                    Some(path.join("."))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for mutator in &step.mutators {
+            match mutator {
+                MutatorDecl::Json { fields, mode, .. } => {
+                    let field_list = fields.clone().unwrap_or_default();
+                    for field in &field_list {
+                        let canonical = format!("body.{}", field);
+                        // Skip bound fields
+                        if bound_fields.contains(field) {
+                            continue;
+                        }
+                        descriptors.push(PartDescriptor {
+                            step_id: step.id.clone(),
+                            canonical_selector: canonical,
+                            input_kind: InputKind::JsonField,
+                            representation: ValueRepresentation::JsonString,
+                            mutation_mode: Some(*mode),
+                        });
+                    }
+                }
+                MutatorDecl::Headers { fields, values: _ } => {
+                    for field in fields {
+                        let canonical = format!("header.{}", field);
+                        descriptors.push(PartDescriptor {
+                            step_id: step.id.clone(),
+                            canonical_selector: canonical,
+                            input_kind: InputKind::HeaderField,
+                            representation: ValueRepresentation::HeaderAscii,
+                            mutation_mode: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    descriptors
+}
+
+// ── Value enumeration ──────────────────────────────────────────────
+
+fn enumerate_values_for_descriptor(
+    step: &Step,
+    descriptor: &PartDescriptor,
+) -> Vec<ReplacementValue> {
+    for mutator in &step.mutators {
+        match mutator {
+            MutatorDecl::Headers { fields, values } => {
+                if fields
+                    .iter()
+                    .any(|f| descriptor.canonical_selector == format!("header.{}", f))
+                {
+                    return values
+                        .iter()
+                        .map(|v| ReplacementValue::HeaderAscii(v.clone()))
+                        .collect();
+                }
+            }
+            MutatorDecl::Json { fields, .. } => {
+                if fields
+                    .iter()
+                    .flatten()
+                    .any(|f| descriptor.canonical_selector == format!("body.{}", f))
+                {
+                    return json_variants(step, descriptor)
+                        .into_iter()
+                        .map(|(_, value)| value)
+                        .collect();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+// ── Baseline value collection ──────────────────────────────────────
+
+/// The value each JSON descriptor has in the baseline request body.
+///
+/// Mutated fields cannot be bound (static validation), so their baseline
+/// value is static: the operation's request example with literal bindings
+/// applied. Headers have no baseline value: a mutated header is only sent
+/// by its variants.
+fn collect_baseline_values(
+    experiment: &Experiment,
+    contract: Option<&ResolvedContract>,
+    descriptors: &[PartDescriptor],
+) -> HashMap<usize, ReplacementValue> {
+    let mut values = HashMap::new();
+    let Some(contract) = contract else {
+        return values;
+    };
+
+    for (desc_idx, descriptor) in descriptors.iter().enumerate() {
+        if descriptor.input_kind != InputKind::JsonField {
+            continue;
+        }
+        let Some(step) = experiment.steps.iter().find(|step| step.id == descriptor.step_id) else {
+            continue;
+        };
+        let Some(operation) = contract.operations.get(&step.operation_id) else {
+            continue;
+        };
+        let Ok(body) = build_baseline_input(operation, &step.bindings) else {
+            continue;
+        };
+        let Some(path) = descriptor.canonical_selector.strip_prefix("body.") else {
+            continue;
+        };
+        if let Some(value) = json_at_path(&body, path) {
+            values.insert(
+                desc_idx,
+                match value {
+                    Value::String(text) => ReplacementValue::JsonString(text.clone()),
+                    other => ReplacementValue::JsonString(other.to_string()),
+                },
+            );
+        }
+    }
+
+    values
+}
+
+/// Look up a dotted path (`metadata.source`) in a JSON value.
+fn json_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.').try_fold(value, |current, key| current.get(key))
+}
+
+// ── Token dictionary ───────────────────────────────────────────────
+
+/// Build a token dictionary from the experiment's static configuration.
+pub fn build_token_dictionary(experiment: &Experiment) -> Vec<Vec<u8>> {
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    let max_tokens = 1024;
+    let max_token_size = 256;
+
+    for step in &experiment.steps {
+        for mutator in &step.mutators {
+            match mutator {
+                MutatorDecl::Headers { values, .. } => {
+                    for v in values {
+                        let bytes = v.as_bytes().to_vec();
+                        if bytes.len() <= max_token_size && tokens.len() < max_tokens {
+                            tokens.push(bytes);
+                        }
+                    }
+                }
+                MutatorDecl::Json { .. } => {
+                    // Add common JSON tokens
+                    let common = [
+                        "null",
+                        "true",
+                        "false",
+                        "0",
+                        "\"\"",
+                        "{}",
+                        "[]",
+                        "\"admin\"",
+                        "\"root\"",
+                        "\"test\"",
+                    ];
+                    for t in &common {
+                        let bytes = t.as_bytes().to_vec();
+                        if tokens.len() < max_tokens {
+                            tokens.push(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tokens.truncate(max_tokens);
+    tokens
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::http::contract;
+    use crate::config;
+    use crate::experiment;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn examples_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+    }
+
+    fn load_experiment(name: &str) -> Experiment {
+        let path = examples_dir().join(format!("{}/experiment.yaml", name));
+        let raw = config::load(&path).unwrap();
+        let openapi_path = examples_dir().join("create-record/openapi.yaml");
+        let contract = contract::load_contract(&openapi_path).unwrap();
+        let mut contracts = HashMap::new();
+        contracts.insert("./openapi.yaml".into(), contract.clone());
+        contracts.insert("../create-record/openapi.yaml".into(), contract);
+        experiment::resolve_experiment(raw, &contracts, &examples_dir()).unwrap()
+    }
+
+    fn create_record_contract() -> ResolvedContract {
+        contract::load_contract(&examples_dir().join("create-record/openapi.yaml")).unwrap()
+    }
+
+    #[test]
+    fn resolves_named_catalog_entry_independently_of_legacy_position() {
+        let experiment = load_experiment("create-record");
+        let v2: RegressionVariant = serde_json::from_value(serde_json::json!({
+            "step_id": "post_record", "selector": "body.title",
+            "variant_id": { "kind": "long_uppercase" }
+        }))
+        .unwrap();
+        let v1: RegressionVariant = serde_json::from_value(serde_json::json!({
+            "step_id": "post_record", "selector": "body.title", "choice": 2
+        }))
+        .unwrap();
+        let expected = Some(ReplacementValue::JsonString("A".repeat(200)));
+        assert_eq!(v2.resolve(&experiment, 2), expected);
+        assert_eq!(v1.resolve(&experiment, 1), expected);
+        assert_eq!(v1.resolve(&experiment, 2), None);
+    }
+
+    #[test]
+    fn test_enumerates_json_values() {
+        let exp = load_experiment("create-record");
+        let contract = create_record_contract();
+        let plans = VariantGenerator::enumerate(&exp, Some(&contract));
+
+        // post_record has a json mutator on "title" — should generate variants
+        let has_title_variant = plans.iter().any(|p| {
+            p.descriptors
+                .iter()
+                .any(|d| d.canonical_selector == "body.title")
+        });
+        assert!(
+            has_title_variant || plans.is_empty(),
+            "expected title variants (or empty if all skip)"
+        );
+    }
+
+    #[test]
+    fn test_enumerates_headers() {
+        let exp = load_experiment("create-record");
+        let contract = create_record_contract();
+        let plans = VariantGenerator::enumerate(&exp, Some(&contract));
+
+        // get_template has a header mutator on Accept-Language with values [en, es]
+        let has_header_variant = plans.iter().any(|p| {
+            p.descriptors
+                .iter()
+                .any(|d| d.canonical_selector == "header.Accept-Language")
+        });
+        assert!(has_header_variant);
+    }
+
+    #[test]
+    fn test_skips_bound_fields() {
+        let exp = load_experiment("create-record");
+        let contract = create_record_contract();
+        let plans = VariantGenerator::enumerate(&exp, Some(&contract));
+
+        // template_id is bound (not in mutators), reference is bound too
+        // Verify no descriptor targets bound fields
+        for plan in &plans {
+            for desc in &plan.descriptors {
+                assert!(
+                    !desc.canonical_selector.contains("template_id"),
+                    "bound field template_id should not be mutable"
+                );
+                assert!(
+                    !desc.canonical_selector.contains("reference"),
+                    "bound field reference should not be mutable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_token_dictionary_size_limit() {
+        let exp = load_experiment("create-record");
+        let tokens = build_token_dictionary(&exp);
+        assert!(
+            tokens.len() <= 1024,
+            "dictionary too large: {}",
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn test_token_dictionary_contains_expected() {
+        let exp = load_experiment("create-record");
+        let tokens = build_token_dictionary(&exp);
+        // Should contain header values from Accept-Language mutator
+        let has_en = tokens.iter().any(|t| t == b"en");
+        let has_es = tokens.iter().any(|t| t == b"es");
+        assert!(has_en || has_es, "dictionary should contain header values");
+    }
+
+    #[test]
+    fn test_skips_values_equal_to_the_request_example() {
+        let exp = load_experiment("create-record");
+        let mut contract = create_record_contract();
+        let title_variants = |contract: &ResolvedContract| {
+            VariantGenerator::enumerate(&exp, Some(contract))
+                .iter()
+                .filter(|plan| {
+                    plan.descriptors
+                        .iter()
+                        .zip(&plan.replacements)
+                        .any(|(d, r)| r.is_some() && d.canonical_selector == "body.title")
+                })
+                .count()
+        };
+        assert_eq!(title_variants(&contract), 5);
+
+        // The baseline request now sends "RESERVED", so that variant is unchanged.
+        let body = contract
+            .operations
+            .get_mut("createRecord")
+            .unwrap()
+            .request_body
+            .as_mut()
+            .unwrap();
+        body.example.as_mut().unwrap()["title"] = Value::String("RESERVED".into());
+        assert_eq!(title_variants(&contract), 4);
+    }
+
+    #[test]
+    fn unconstrained_values_round_trip_through_stable_names() {
+        let experiment = load_experiment("fuzz-probe");
+        let descriptor = build_descriptors(&experiment).remove(0);
+        assert_eq!(descriptor.mutation_mode, Some(JsonMutatorMode::Unconstrained));
+        let step = &experiment.steps[0];
+        let values = enumerate_values_for_descriptor(step, &descriptor);
+        assert_eq!(values.len(), 8);
+        let mut names = Vec::new();
+        for value in &values {
+            let variant = RegressionVariant::from_replacement(&experiment, &descriptor, value)
+                .unwrap_or_else(|| panic!("no stable name for {value:?}"));
+            let saved = serde_json::to_value(&variant).unwrap();
+            names.push(saved["variant_id"]["kind"].as_str().unwrap().to_owned());
+            let loaded: RegressionVariant = serde_json::from_value(saved).unwrap();
+            assert_eq!(loaded.resolve(&experiment, 2).as_ref(), Some(value));
+        }
+        assert_eq!(
+            names,
+            [
+                "empty", "long_lowercase", "nul_byte", "huge_uppercase",
+                "script_tag", "sql_quote", "template_syntax", "null_string"
+            ]
+        );
+        // A name from the other catalog does not resolve for this step.
+        let foreign: RegressionVariant = serde_json::from_value(serde_json::json!({
+            "step_id": "probe", "selector": "body.value",
+            "variant_id": { "kind": "unicode" }
+        }))
+        .unwrap();
+        assert_eq!(foreign.resolve(&experiment, 2), None);
+    }
+
+    fn names(field: FieldSchema) -> Vec<String> {
+        schema_variants(&field)
+            .into_iter()
+            .map(|(id, _)| {
+                serde_json::to_value(id).unwrap()["kind"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    fn value_of(field: FieldSchema, name: &str) -> ReplacementValue {
+        schema_variants(&field)
+            .into_iter()
+            .find(|(id, _)| serde_json::to_value(id).unwrap()["kind"] == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+            .1
+    }
+
+    fn field(schema: Value, required: bool) -> FieldSchema {
+        FieldSchema { schema, required }
+    }
+
+    #[test]
+    fn schema_variants_for_strings() {
+        let title = field(
+            serde_json::json!({"type": "string", "minLength": 2, "maxLength": 4, "format": "email"}),
+            true,
+        );
+        assert_eq!(
+            names(title.clone()),
+            [
+                "missing_field", "null_value", "wrong_type_number", "wrong_type_boolean",
+                "wrong_type_array", "wrong_type_object", "too_short", "at_max_length",
+                "over_max_length", "bad_format"
+            ]
+        );
+        assert_eq!(value_of(title.clone(), "missing_field"), ReplacementValue::Absent);
+        assert_eq!(value_of(title.clone(), "too_short"), ReplacementValue::JsonString("a".into()));
+        assert_eq!(value_of(title.clone(), "at_max_length"), ReplacementValue::JsonString("aaaa".into()));
+        assert_eq!(value_of(title.clone(), "over_max_length"), ReplacementValue::JsonString("aaaaa".into()));
+        assert_eq!(
+            value_of(title, "bad_format"),
+            ReplacementValue::JsonString("not-a-valid-email".into())
+        );
+
+        // Optional, nullable, enum-restricted.
+        let status = field(serde_json::json!({"type": ["string", "null"], "enum": ["a", "b"]}), false);
+        let names = names(status.clone());
+        assert!(!names.contains(&"missing_field".to_string()));
+        assert!(!names.contains(&"null_value".to_string()));
+        assert_eq!(
+            value_of(status, "not_in_enum"),
+            ReplacementValue::JsonString("nadir-not-in-enum".into())
+        );
+    }
+
+    #[test]
+    fn schema_variants_for_numbers_arrays_and_objects() {
+        let json = ReplacementValue::JsonValue;
+        let count = field(serde_json::json!({"type": "integer", "minimum": 1, "maximum": 10}), false);
+        assert_eq!(value_of(count.clone(), "below_minimum"), json(Value::from(0)));
+        assert_eq!(value_of(count.clone(), "above_maximum"), json(Value::from(11)));
+        assert_eq!(value_of(count.clone(), "fraction"), json(Value::from(1.5)));
+        assert_eq!(value_of(count.clone(), "integer_overflow"), json(Value::from(u64::MAX)));
+        assert!(!names(count).contains(&"negative_one".to_string()));
+
+        // OpenAPI 3.1 numeric exclusive bounds are themselves out of range.
+        let ratio = field(serde_json::json!({"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}), false);
+        assert_eq!(value_of(ratio.clone(), "below_minimum"), json(Value::from(0)));
+        assert_eq!(value_of(ratio.clone(), "above_maximum"), json(Value::from(1)));
+        assert_eq!(value_of(ratio, "huge_number"), json(Value::from(f64::MAX)));
+
+        let unbounded = field(serde_json::json!({"type": "number"}), false);
+        assert_eq!(value_of(unbounded, "negative_one"), json(Value::from(-1)));
+
+        let tags = field(serde_json::json!({"type": "array", "minItems": 1, "maxItems": 2}), false);
+        assert_eq!(value_of(tags.clone(), "empty_array"), json(serde_json::json!([])));
+        assert_eq!(value_of(tags, "over_max_items"), json(serde_json::json!([null, null, null])));
+
+        let metadata = field(serde_json::json!({"type": "object", "required": ["source"]}), false);
+        assert_eq!(value_of(metadata, "empty_object"), json(serde_json::json!({})));
+
+        // Without a declared type, only the requirement can be probed.
+        assert_eq!(names(field(serde_json::json!({}), true)), ["missing_field"]);
+    }
+
+    #[test]
+    fn schema_mode_reads_nested_field_schemas_and_custom_values() {
+        let mut experiment = load_experiment("create-record");
+        let step = experiment.steps.iter_mut().find(|step| step.id == "post_record").unwrap();
+        // Replace the edge_cases mutator with a schema one on a nested field.
+        step.bindings.retain(|binding| binding.selector.to_string() != "body.metadata.source");
+        step.mutators = vec![MutatorDecl::Json {
+            fields: Some(vec!["metadata.source".into()]),
+            mode: JsonMutatorMode::Schema,
+            values: vec![Value::from("custom"), serde_json::json!({"k": 1})],
+            field_schemas: [(
+                "metadata.source".to_string(),
+                field(serde_json::json!({"type": "string", "minLength": 1}), true),
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        let descriptor = build_descriptors(&experiment)
+            .into_iter()
+            .find(|d| d.canonical_selector == "body.metadata.source")
+            .unwrap();
+        let step = experiment.steps.iter().find(|step| step.id == "post_record").unwrap();
+        let values = enumerate_values_for_descriptor(step, &descriptor);
+        assert_eq!(values.first(), Some(&ReplacementValue::Absent));
+        assert_eq!(values[values.len() - 2], ReplacementValue::JsonString("custom".into()));
+        assert_eq!(values.last(), Some(&ReplacementValue::JsonValue(serde_json::json!({"k": 1}))));
+        for value in &values {
+            let variant = RegressionVariant::from_replacement(&experiment, &descriptor, value).unwrap();
+            assert_eq!(variant.resolve(&experiment, 2).as_ref(), Some(value));
+            let saved = serde_json::to_value(&variant).unwrap();
+            let rejects = !matches!(saved["variant_id"]["kind"].as_str(), Some("custom"));
+            assert_eq!(variant.expects_rejection(), rejects, "{saved}");
+        }
+    }
+
+    #[test]
+    fn test_json_at_path_reads_nested_fields() {
+        let body = serde_json::json!({ "title": "t", "metadata": { "source": "nadir" } });
+        assert_eq!(json_at_path(&body, "metadata.source"), Some(&Value::from("nadir")));
+        assert_eq!(json_at_path(&body, "title"), Some(&Value::from("t")));
+        assert_eq!(json_at_path(&body, "metadata.missing"), None);
+        assert_eq!(json_at_path(&body, "title.deeper"), None);
+    }
+
+    #[test]
+    fn test_detects_unchanged() {
+        let exp = load_experiment("create-record");
+        let contract = create_record_contract();
+        let plans = VariantGenerator::enumerate(&exp, Some(&contract));
+
+        // The baseline title is "Default Record" — none of the generated
+        // values should match this exactly
+        for plan in &plans {
+            for (idx, replacement) in plan.replacements.iter().enumerate() {
+                if let Some(ReplacementValue::JsonString(ref s)) = replacement {
+                    assert_ne!(
+                        s, "Default Record",
+                        "unchanged value not filtered for descriptor idx {}",
+                        idx
+                    );
+                }
+            }
+        }
+    }
+}

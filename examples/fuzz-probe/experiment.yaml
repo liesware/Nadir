@@ -1,0 +1,70 @@
+version: 1
+
+# Fuzzes one endpoint (strategy: fuzz) and reports conformance failures,
+# server errors, accepted invalid input, or a crash of the target process.
+#
+# 1. Enumeration: two steps probe the same endpoint.
+#    - probe:        aggressive strings (NUL byte, 64 KiB string, HTML, SQL
+#                    quote, template syntax) from the `unconstrained` catalog;
+#    - probe_schema: values derived from the field's OpenAPI schema (missing,
+#                    null, wrong types, length limits) plus custom values. The
+#                    schema forbids most of them, so the endpoint must reject
+#                    them with a 4xx status (rule `schema:rejects-invalid`).
+# 2. Random phase: for `duration_s` seconds (or `max_execs` cases), random
+#    cases mutate and combine those values. `seed` makes the run repeatable;
+#    without it, each run picks and prints a new seed.
+#
+# NADIR_FIXTURE_MODE=lenient makes the bundled API accept any value, which
+# this experiment reports.
+#
+# Coverage-guided fuzzing (`target.coverage`) is not available yet.
+
+experiment:
+  name: fuzz-probe
+  max_cases: 24
+  exploration:
+    strategy: fuzz
+    duration_s: 5
+    max_execs: 2000
+    seed: 1
+
+  target:
+    command: ["python3", "-I", "../../tests/fixtures/python_api/server.py",
+              "--port", "${target.port}",
+              "--mode", "${env.NADIR_FIXTURE_MODE:-corrected}"]
+    ready:
+      path: /health
+
+  adapters:
+    http:
+      base_url: http://127.0.0.1:8081
+      openapi: ../create-record/openapi.yaml
+      timeout_ms: 2000
+
+  steps:
+    - id: probe
+      adapter: http
+      operation_id: probeString
+      cases:
+        mutators:
+          - use: json
+            fields: [value]
+            mode: unconstrained
+      oracles:
+        - use: openapi
+        - id: probe-echoes-json
+          use: openapi_schema
+
+    - id: probe_schema
+      adapter: http
+      operation_id: probeString
+      cases:
+        mutators:
+          - use: json
+            fields: [value]
+            mode: schema
+            values: ["../../etc/passwd", "%00", "' OR 1=1--"]
+      oracles:
+        - use: openapi
+        - id: probe-schema-echoes-json
+          use: openapi_schema
