@@ -26,6 +26,13 @@ impl StepObservation {
         self.as_http().map(|response| response.status)
     }
 
+    pub(crate) fn as_cli(&self) -> Option<&crate::adapters::cli::CliObservation> {
+        match self {
+            Self::Cli(observation) => Some(observation),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_truncated(&self) -> bool {
         self.as_http().is_some_and(|response| response.truncated)
     }
@@ -246,6 +253,7 @@ mod tests {
             timed_out: false,
             ready: None,
             stopped_code: None,
+            process_diagnostic: None,
         };
         let obs = StepObservation::Cli(cli);
         assert_eq!(

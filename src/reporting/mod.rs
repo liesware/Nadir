@@ -196,7 +196,17 @@ pub(crate) fn print_regression_run(
         }
     }
     let kept = result.fuzz.as_ref().map_or(0, |fuzz| fuzz.kept);
-    eprintln!("Enumeration cases: {}", written.record.cases.len() - kept);
+    let enumerated = written.record.cases.len() - kept;
+    if result.capped_by_max_cases && result.planned_cases > enumerated {
+        // The random phase may have run after it: say it here, not only in Stop reason.
+        eprintln!(
+            "Enumeration cases: {enumerated} of {} (max_cases reached: {} enumerated cases did not run; raise max_cases)",
+            result.planned_cases,
+            result.planned_cases - enumerated
+        );
+    } else {
+        eprintln!("Enumeration cases: {enumerated}");
+    }
     if let Some(fuzz) = &result.fuzz {
         eprintln!(
             "Random cases: {} (kept {}, seed {})",

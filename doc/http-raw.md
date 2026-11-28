@@ -26,7 +26,7 @@ steps:
 
 **Un paso `http_raw`:**
 - Usa la configuración de `protocols.http` (`base_url`, `openapi`) y arma la petición igual que `http` (`operation_*`, `bind`, `body_example`, `auth`). La escribe byte a byte en un socket TCP de loopback, con `Host`, `Content-Length` y `Connection: close`. El caso base también va por este socket, así se comprueba que el endpoint responde antes de romperlo.
-- Solo admite `use: malform`. Otro mutador, `cases.examples` u `outputs` dan error, y `malform` en un paso `http` también.
+- Solo admite `use: malform`, con `mode: catalog`, `only` y `sizes`. Otro mutador, `cases.examples` u `outputs` dan error, y `malform` en un paso `http` también.
 - Después de enviar, Nadir cierra su lado de escritura. Un servidor que espera bytes que la petición prometió (un `Content-Length` largo, una línea vacía que no llega) recibe así un fin claro y puede responder o cerrar.
 
 **`mode: catalog`:** una lista fija de malformaciones con nombre. Cada una parte de la petición bien formada, cambia **una sola cosa** y genera un caso. `only` elige algunas; sin `only`, se ejecutan todas. El caso guardado lleva el nombre y `replay` reconstruye los mismos bytes. `mode: random` (corrupción aleatoria de bytes) llegará en una fase posterior.
@@ -52,3 +52,16 @@ Las malformaciones del cuerpo usan un cuerpo de relleno si la petición no tiene
 | se cae | **hallazgo** `process_exit` |
 
 En la pantalla, `print` muestra la petición base y `malform: catalog, 28 cases`. `debug` muestra los bytes exactos que se enviaron: una fila por cada `\r\n`, con un `\r` o `\n` suelto y los caracteres invisibles escapados. Un crash aparece como `wire:handled · axum · length_and_chunked · HTTP 500`.
+
+**`sizes`: apuntar al límite del servidor.** `huge_uri`, `huge_header` y `many_headers` usan por defecto tamaños muy por encima de cualquier límite: un destino de 64 KiB, una cabecera de 64 KiB y 10 000 cabeceras. Con `sizes` se ajustan, por ejemplo a un byte por encima del límite documentado del servidor, que es donde suelen estar los errores:
+
+```yaml
+- use: malform
+  only: [huge_uri, huge_header, many_headers]
+  sizes:
+    uri: 8193        # bytes totales del destino (ruta y query) de huge_uri
+    header: 16385    # bytes del valor de X-Nadir en huge_header
+    headers: 101     # cabeceras que agrega many_headers
+```
+
+Cada valor va de 1 a 16 MiB, y los que no se declaran conservan su valor por defecto. `print` los muestra (`malform sizes: uri 8193 bytes, header 16385 bytes, 101 headers`) cuando difieren de los de siempre.

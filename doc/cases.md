@@ -124,6 +124,26 @@ Cada combinación de campo y valor genera **una variante**. Con `fields: [title]
 
 `path` es la forma general. `use: file` y `use: file_fuzz` (abajo) se mantienen para los experimentos que ya los usan: recorren las líneas en ciclo hasta `repetitions` y solo admiten letras, dígitos y espacios en un campo del cuerpo.
 
+## `use: body`: caracteres aleatorios en el cuerpo JSON
+
+Los demás mutadores producen JSON válido (los caracteres raros van escapados dentro de una cadena). `use: body` rompe el **texto** del cuerpo: en cada caso aleatorio toma el cuerpo que el paso enviaría, ya serializado y con los `bind` aplicados, y le hace de 1 a `edits.max` cambios en posiciones al azar.
+
+```yaml
+cases:
+  mutators:
+    - use: body
+      mode: raw            # alpha, alphanum, num o raw (por defecto raw)
+      edits: { max: 4 }    # por defecto 4, hasta 64
+```
+
+- **Cambios:** insertar de 1 a 4 caracteres, borrar un tramo de hasta 8, reemplazar un carácter o duplicar un tramo de hasta 16.
+- **Qué se inserta:** la mitad de las veces un carácter del modo, la otra mitad uno de estructura de JSON (`{ } [ ] : , " \`), que son los que rompen el parser. Con solo letras, casi todos los cambios caerían dentro de una cadena.
+- **El mensaje HTTP sigue siendo válido:** el cliente recalcula `Content-Length` y mantiene `Content-Type: application/json`. Para romper el HTTP, usa [`http_raw`](http-raw.md).
+- **Requisitos:** `strategy: fuzz` (son casos aleatorios: cuentan contra `max_execs` y se repiten desde la semilla) y una operación con cuerpo `application/json`.
+- **`print`:** `body: random edits (raw, 1 to 4 per case: insert, delete, replace, duplicate)`. `debug` muestra el cuerpo ya roto.
+
+**`body:handled`** es la regla implícita de estos casos: el servicio debe responder **sin 5xx** antes del timeout. Un 4xx es lo esperado, y un 2xx también se acepta, porque a veces el cambio cae dentro de una cadena y el JSON sigue siendo válido. A diferencia de `wire:handled`, cerrar la conexión sin responder falla (`Unresponsive`), porque el mensaje HTTP es válido. Tus oráculos del paso solo juzgan el caso base: un `expect: 200` fallaría casi siempre con un cuerpo roto.
+
 ## Corpus de texto por líneas
 
 En `cases.mutators`, `use: file` envía cada línea tal como se leyó. `use: file_fuzz` usa cada línea como punto de partida, conserva el prefijo compatible con el alfabeto elegido y ajusta la longitud con una semilla fija.

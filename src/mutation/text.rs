@@ -12,7 +12,7 @@ pub(crate) const MAX_TEXT_CHARS: usize = 4096;
 const MAX_CORPUS_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Alphabet {
+pub enum Alphabet {
     Alpha,
     Alphanum,
     /// Any Unicode scalar value worth probing: printable ASCII with

@@ -20,6 +20,7 @@ Documentación de referencia, en [`doc/`](doc/):
 
 | Página | Contenido |
 |---|---|
+| [Mapa de capacidades](doc/capabilities.md) | Protocolos, mutadores, modos, reglas implícitas, selectores y `replay`, en tablas |
 | [Configuración: el archivo de experimento](doc/experiment.md) | Estructura completa, `exploration`, `max_cases`, referencias `${...}`, `target`, `bind`, `auth`, `outputs`, `hidden` |
 | [`cases`: qué variar](doc/cases.md) | Mutadores `json` y `http`, corpus de texto, `examples`, nombres de claves y sintaxis JSON |
 | [`http_raw` y `malform`](doc/http-raw.md) | Peticiones HTTP mal formadas |

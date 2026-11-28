@@ -114,6 +114,8 @@ Una salida confirmada del objetivo genera un YAML de solo lectura en `artifacts/
 
 Nadir guarda las salidas confirmadas como `process_exit`. Si el proceso sigue activo o no se puede confirmar su salida, el evento se registra como `transport_error`. Nadir guarda la primera captura por paso, motivo y fase de transporte por ejecución. La consola muestra estos eventos en `transport errors`. `Transport errors` cuenta todas las ocurrencias por separado de `Findings`. Un cierre antes de los encabezados que el propio caso acepta permanece en el registro del caso, fuera del contador y de las alertas de transporte. Una salida confirmada conserva su diagnóstico.
 
+**Peticiones no enviables (`unsendable`).** Si el cliente HTTP no puede ni armar la petición, por ejemplo con una URL de más de 65 534 bytes (el límite del crate `http`) o una cabecera inválida, el paso termina como `transport_error (unsendable)`: no llegó nada al servicio, así que no es un fallo de conexión y no se guarda en `artifacts/transport-errors/`. Los oráculos de ese paso quedan `inconclusive`. Para que los casos aleatorios no caigan ahí, los valores aleatorios de parámetros de ruta se recortan a `protocols.http.max_path_chars` caracteres (ver [`experiment.md`](experiment.md#estructura-completa)). Un caso enumerado como `huge_uppercase` (65 536 caracteres) en una ruta sí puede ser no enviable.
+
 **`nadir replay`** vuelve a ejecutar la variante guardada contra el servicio *actual*:
 
 - Antes de enviar nada (y antes de arrancar el `target`), comprueba que el caso guardado se puede repetir. Si no se puede, sale con `2` sin arrancar el servicio.

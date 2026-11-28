@@ -20,10 +20,28 @@ pub struct RawRequest {
     pub body: Vec<u8>,
 }
 
-/// Size of the long URI and header values.
+/// Default size of the long URI and header values.
 const HUGE: usize = 64 * 1024;
-/// Header count for `many_headers`.
+/// Default header count for `many_headers`.
 const MANY_HEADERS: usize = 10_000;
+
+/// The sizes of `huge_uri`, `huge_header` and `many_headers` (`malform`
+/// `sizes`): aim them one byte past the server's documented limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformSizes {
+    /// Total bytes of the request target (path and query) of `huge_uri`.
+    pub uri: usize,
+    /// Bytes of the `X-Nadir` value of `huge_header`.
+    pub header: usize,
+    /// Headers `many_headers` adds.
+    pub headers: usize,
+}
+
+impl Default for MalformSizes {
+    fn default() -> Self {
+        Self { uri: HUGE, header: HUGE, headers: MANY_HEADERS }
+    }
+}
 /// Body used by body-framing malformations when the request has none.
 const FILLER_BODY: &[u8] = b"nadir-body";
 
@@ -145,6 +163,11 @@ malformations! {
 impl Malformation {
     /// The bytes of `request` with this one thing broken.
     pub fn apply(self, request: &RawRequest) -> Vec<u8> {
+        self.apply_sized(request, &MalformSizes::default())
+    }
+
+    /// The bytes of `request` with this one thing broken, at these sizes.
+    pub fn apply_sized(self, request: &RawRequest, sizes: &MalformSizes) -> Vec<u8> {
         let mut broken = request.clone();
         match self {
             Self::BadMethod => {
@@ -165,7 +188,9 @@ impl Malformation {
             Self::DoubleSpace => broken.method.push(' '),
             Self::HugeUri => {
                 let separator = if broken.target.contains('?') { '&' } else { '?' };
-                broken.target = format!("{}{separator}nadir={}", broken.target, "A".repeat(HUGE));
+                // Padded so the whole target is `sizes.uri` bytes long.
+                let prefix = format!("{}{separator}nadir=", broken.target);
+                broken.target = format!("{prefix}{}", "A".repeat(sizes.uri.saturating_sub(prefix.len())));
             }
             Self::NulInPath => broken.target = broken.with_in_path("\0"),
             Self::CrInPath => broken.target = broken.with_in_path("\r"),
@@ -188,9 +213,9 @@ impl Malformation {
             // obs-fold: a value continued on the next line.
             Self::FoldedHeader => broken.headers.push(("X-Nadir".into(), "first\r\n second".into())),
             Self::ManyHeaders => {
-                broken.headers.extend((0..MANY_HEADERS).map(|index| (format!("X-Nadir-{index}"), "x".into())));
+                broken.headers.extend((0..sizes.headers).map(|index| (format!("X-Nadir-{index}"), "x".into())));
             }
-            Self::HugeHeader => broken.headers.push(("X-Nadir".into(), "A".repeat(HUGE))),
+            Self::HugeHeader => broken.headers.push(("X-Nadir".into(), "A".repeat(sizes.header))),
             Self::MissingHost => broken.remove_header("Host"),
             Self::DuplicateHost => broken.headers.push(("Host".into(), "nadir.invalid".into())),
             Self::ShortLength => {
@@ -246,6 +271,18 @@ impl Malformation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_aim_the_big_cases_at_a_chosen_limit() {
+        let sizes = MalformSizes { uri: 8193, header: 16385, headers: 101 };
+        let text = |malformation: Malformation| String::from_utf8(malformation.apply_sized(&login(), &sizes)).unwrap();
+        let first_line = text(Malformation::HugeUri).lines().next().unwrap().to_owned();
+        let target = first_line.split(' ').nth(1).unwrap();
+        assert_eq!(target.len(), 8193, "{}", &target[..40]);
+        assert!(text(Malformation::HugeHeader).contains(&format!("X-Nadir: {}\r\n", "A".repeat(16385))));
+        assert_eq!(text(Malformation::ManyHeaders).matches("\r\nX-Nadir-").count(), 101);
+        assert_eq!(MalformSizes::default(), MalformSizes { uri: 65536, header: 65536, headers: 10_000 });
+    }
 
     fn login() -> RawRequest {
         RawRequest {

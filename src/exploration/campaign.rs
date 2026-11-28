@@ -1,5 +1,4 @@
-//! Campaign orchestration: full fuzz loop wiring enumeration, mutation,
-//! oracles, findings, and budgets into a single campaign.
+//! Compatibility API for the legacy campaign result.
 
 use std::path::Path;
 
@@ -9,7 +8,7 @@ use crate::exploration::budget::{RunBudget, RunStopReason};
 use crate::exploration::enumerate;
 use crate::finding::DedupMap;
 
-/// Result of a full campaign run.
+/// Legacy result returned by `run_campaign`.
 pub struct CampaignResult {
     pub baseline: Option<CaseResult>,
     pub enumeration_cases: Vec<CaseResult>,
@@ -35,7 +34,13 @@ pub struct CampaignPhases {
     pub campaign_completed: bool,
 }
 
-/// Run a full campaign: enumeration + optional fuzz phase.
+/// Run an experiment and project its results into the legacy campaign format.
+///
+/// `_corpus_import` is ignored. [`CampaignResult`] has no separate result for
+/// the random phase. Use [`crate::exploration::run_enumeration`] with a
+/// mutable reference to [`RunBudget`] to get an
+/// [`EnumerationResult`](crate::exploration::EnumerationResult).
+#[deprecated(note = "use nadir::exploration::run_enumeration with a mutable RunBudget")]
 pub fn run_campaign(
     runner: &mut WorkflowRunner,
     experiment: &Experiment,

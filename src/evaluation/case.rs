@@ -1,9 +1,12 @@
+use crate::adapters::cli::envbreak::CaseEvidence as EnvFileEvidence;
+use crate::adapters::cli::{CliObservation, ProcessDiagnostic};
 use crate::execution::runner::{CaseResult, StepOutcome};
 use crate::experiment::selectors::ObservationSelector;
 use crate::experiment::types::{
     ExpectCondition, Experiment, OracleDecl, OracleType, ReplacementValue,
 };
 use crate::mutation::RegressionVariant;
+use crate::observation::{SelectedValue, StepObservation};
 
 use super::schema_validator::SchemaValidatorCache;
 
@@ -17,17 +20,8 @@ pub(crate) const STARTUP_REFUSES_RULE: &str = "startup:refuses";
 pub(crate) const STARTUP_DEFAULTS_RULE: &str = "startup:defaults";
 /// The implicit rule of every `envfile` case.
 pub(crate) const ENVFILE_REFUSES_RULE: &str = "envfile:refuses";
-
-/// The file and the broken form of an `envfile` case, from the step.
-fn envfile_case(step: &crate::experiment::types::Step, name: &str) -> Option<(String, crate::adapters::cli::envbreak::Applied)> {
-    step.mutators.iter().find_map(|mutator| match mutator {
-        crate::experiment::types::MutatorDecl::EnvFile { file, base, cases } => cases
-            .iter()
-            .find(|case| case.name == name)
-            .map(|case| (file.clone(), crate::adapters::cli::envbreak::apply(base, case))),
-        _ => None,
-    })
-}
+/// The implicit rule of every `use: body` case.
+pub(crate) const BODY_HANDLED_RULE: &str = "body:handled";
 
 /// How a `mode: spec` case is judged.
 enum SpecJudgement<'a> {
@@ -77,6 +71,8 @@ pub enum ExecutedPlan {
         generator: u32,
         max_fields: Option<u16>,
         key_expectation: Option<(String, u16)>,
+        /// `use: body`: the case broke the body text.
+        body_edits: bool,
     },
     /// An enumerated `envar` case: one variable of a cli step set to `value`.
     Envar {
@@ -118,6 +114,29 @@ impl EvaluatedCase {
         plan: ExecutedPlan,
         schema_cache: &SchemaValidatorCache,
     ) -> Self {
+        Self::evaluate(experiment, execution, plan, schema_cache, None)
+    }
+
+    pub(crate) fn new_envfile(
+        experiment: &Experiment,
+        execution: CaseResult,
+        evidence: EnvFileEvidence<'_>,
+        schema_cache: &SchemaValidatorCache,
+    ) -> Self {
+        let plan = ExecutedPlan::EnvFile {
+            step_id: evidence.step_id.to_owned(),
+            name: evidence.name.to_owned(),
+        };
+        Self::evaluate(experiment, execution, plan, schema_cache, Some(evidence))
+    }
+
+    fn evaluate(
+        experiment: &Experiment,
+        execution: CaseResult,
+        plan: ExecutedPlan,
+        schema_cache: &SchemaValidatorCache,
+        envfile_evidence: Option<EnvFileEvidence<'_>>,
+    ) -> Self {
         let outputs = std::collections::HashMap::new();
         let checks = execution
             .step_results
@@ -142,13 +161,9 @@ impl EvaluatedCase {
                 // A malformed request is judged by `wire:handled` alone: the
                 // step's own oracles describe the well-formed baseline.
                 let malformed = matches!(&plan, ExecutedPlan::Malform { step_id, .. } if step_id == &result.step_id);
-                // A broken file is judged by `envfile:refuses` alone.
-                let envfile = match &plan {
-                    ExecutedPlan::EnvFile { step_id, name } if step_id == &result.step_id => {
-                        step.and_then(|step| envfile_case(step, name))
-                    }
-                    _ => None,
-                };
+                // A body with random edits is judged by `body:handled` alone.
+                let body_broken = matches!(&plan, ExecutedPlan::Fuzz { step_id, body_edits: true, .. } if step_id == &result.step_id);
+                let envfile = envfile_evidence.filter(|evidence| evidence.step_id == result.step_id);
                 // A spec case is judged by `startup:refuses` alone, like `malform`.
                 let spec_case = match &plan {
                     ExecutedPlan::Envar { step_id, variable, case, value } if step_id == &result.step_id => {
@@ -169,7 +184,7 @@ impl EvaluatedCase {
                     .flat_map(|step| &step.oracles)
                     .map(|oracle| CaseCheck {
                         oracle: oracle.clone(),
-                        evaluation: if malformed || spec_case.is_some() || envfile.is_some() {
+                        evaluation: if malformed || body_broken || spec_case.is_some() || envfile.is_some() {
                             OracleEvaluation { verdict: Verdict::Skipped, observed: None, reason: None, schema_location: None }
                         } else {
                             evaluate_check(oracle, &context)
@@ -201,7 +216,23 @@ impl EvaluatedCase {
                         record_observation_on_pass: true,
                     });
                 }
-                if let Some((file, applied)) = &envfile {
+                if body_broken {
+                    checks.push(CaseCheck {
+                        oracle: OracleDecl {
+                            id: BODY_HANDLED_RULE.into(),
+                            oracle_type: OracleType::Assert,
+                            kind: None,
+                            setup: false,
+                            select: Some(ObservationSelector::Status),
+                            when_condition: None,
+                            expect: Some(ExpectCondition::Handled),
+                            record_reference: None,
+                        },
+                        evaluation: body_handled(result),
+                        record_observation_on_pass: true,
+                    });
+                }
+                if let Some(evidence) = envfile {
                     checks.push(CaseCheck {
                         oracle: OracleDecl {
                             id: ENVFILE_REFUSES_RULE.into(),
@@ -213,7 +244,7 @@ impl EvaluatedCase {
                             expect: Some(ExpectCondition::Refused),
                             record_reference: None,
                         },
-                        evaluation: envfile_refuses(result, file, applied),
+                        evaluation: envfile_refuses(result, evidence),
                         record_observation_on_pass: true,
                     });
                 }
@@ -319,7 +350,10 @@ impl EvaluatedCase {
                 || step
                     .observation
                     .as_ref()
-                    .is_none_or(|response| response.is_truncated()))
+                    .is_none_or(|response| {
+                        response.is_truncated()
+                            || response.as_cli().is_some_and(CliObservation::is_incomplete)
+                    }))
         }) || self
             .checks
             .iter()
@@ -375,11 +409,34 @@ impl RunStatus {
 /// (`0`, ` sqlite `) appear in normal messages by chance.
 const ECHO_MARKER: &str = "nadir";
 
+fn process_diagnostic_verdict(run: &CliObservation) -> Option<OracleEvaluation> {
+    let diagnosis = run.exit_diagnostic()?;
+    let (verdict, reason) = match diagnosis {
+        ProcessDiagnostic::Signaled { .. } => (
+            Verdict::Fail { category: super::ViolationCategory::Crash },
+            None,
+        ),
+        ProcessDiagnostic::StatusError { .. } => (
+            Verdict::Inconclusive,
+            Some("process status unavailable"),
+        ),
+        ProcessDiagnostic::SpawnError { .. } => (
+            Verdict::Inconclusive,
+            Some("process failed to start"),
+        ),
+    };
+    Some(OracleEvaluation {
+        verdict,
+        observed: Some(SelectedValue::Present(serde_json::Value::String(diagnosis.to_string()))),
+        reason,
+        schema_location: None,
+    })
+}
+
 /// `startup:refuses`: with one variable breaking its specification, the
 /// service must exit before ready with a non-zero code (not a panic, a
 /// signal or a timeout), name the variable, and not echo the value.
 fn startup_refuses(result: &crate::execution::runner::StepResult, variable: &str, value: &str) -> OracleEvaluation {
-    use crate::observation::{SelectedValue, StepObservation};
     use super::ViolationCategory::*;
     let verdict = |verdict, observed: String| OracleEvaluation {
         verdict,
@@ -390,6 +447,9 @@ fn startup_refuses(result: &crate::execution::runner::StepResult, variable: &str
     let Some(StepObservation::Cli(run)) = &result.observation else {
         return OracleEvaluation { verdict: Verdict::Inconclusive, observed: None, reason: None, schema_location: None };
     };
+    if let Some(evaluation) = process_diagnostic_verdict(run) {
+        return evaluation;
+    }
     let output = format!("{}\n{}", run.stdout, run.stderr);
     if run.ready == Some(true) {
         return verdict(Verdict::Fail { category: AcceptedInvalidConfig }, "started (ready)".into());
@@ -419,11 +479,9 @@ fn startup_refuses(result: &crate::execution::runner::StepResult, variable: &str
 /// the file name for a file-level problem) and not print the injected value.
 fn envfile_refuses(
     result: &crate::execution::runner::StepResult,
-    file: &str,
-    applied: &crate::adapters::cli::envbreak::Applied,
+    evidence: EnvFileEvidence<'_>,
 ) -> OracleEvaluation {
     use crate::adapters::cli::envbreak::Location;
-    use crate::observation::{SelectedValue, StepObservation};
     use super::ViolationCategory::*;
     let verdict = |verdict, observed: String| OracleEvaluation {
         verdict,
@@ -434,6 +492,9 @@ fn envfile_refuses(
     let Some(StepObservation::Cli(run)) = &result.observation else {
         return OracleEvaluation { verdict: Verdict::Inconclusive, observed: None, reason: None, schema_location: None };
     };
+    if let Some(evaluation) = process_diagnostic_verdict(run) {
+        return evaluation;
+    }
     let output = format!("{}\n{}", run.stdout, run.stderr);
     if run.ready == Some(true) {
         return verdict(Verdict::Fail { category: AcceptedInvalidConfig }, "started (ready)".into());
@@ -447,11 +508,12 @@ fn envfile_refuses(
     if run.exit_code == 0 {
         return verdict(Verdict::Fail { category: AcceptedInvalidConfig }, "exited 0".into());
     }
-    if applied.token.is_some_and(|token| output.contains(token)) {
+    if evidence.token.is_some_and(|token| output.contains(token)) {
         return verdict(Verdict::Fail { category: Security }, format!("exited {}, printing the value", run.exit_code));
     }
+    let file = evidence.file;
     let name = std::path::Path::new(file).file_name().and_then(|name| name.to_str()).unwrap_or(file);
-    let (expected, found) = match applied.location {
+    let (expected, found) = match evidence.location {
         Location::Line(line) => (format!("line {line}"), output.contains(&format!("line {line}"))),
         Location::File => (name.to_owned(), output.contains(name)),
     };
@@ -464,7 +526,6 @@ fn envfile_refuses(
 /// `startup:defaults`: without an optional variable the program must start
 /// with its documented default: ready with `service`, exit 0 without it.
 fn startup_defaults(result: &crate::execution::runner::StepResult, variable: &str) -> OracleEvaluation {
-    use crate::observation::{SelectedValue, StepObservation};
     use super::ViolationCategory::*;
     let verdict = |verdict, observed: String| OracleEvaluation {
         verdict,
@@ -475,6 +536,9 @@ fn startup_defaults(result: &crate::execution::runner::StepResult, variable: &st
     let Some(StepObservation::Cli(run)) = &result.observation else {
         return OracleEvaluation { verdict: Verdict::Inconclusive, observed: None, reason: None, schema_location: None };
     };
+    if let Some(evaluation) = process_diagnostic_verdict(run) {
+        return evaluation;
+    }
     // The error is usually the last line of stderr; stdout only without one.
     let last = |text: &str| text.lines().rfind(|line| !line.trim().is_empty()).map(str::to_owned);
     let last_line = last(&run.stderr).or_else(|| last(&run.stdout)).unwrap_or_default();
@@ -489,6 +553,37 @@ fn startup_defaults(result: &crate::execution::runner::StepResult, variable: &st
             Verdict::Fail { category: Assertion },
             format!("exited {code} without {variable}, which has a default: {last_line}"),
         ),
+    }
+}
+
+/// `body:handled`: a well-framed request with a broken JSON body must get an
+/// answer without a 5xx before the timeout. Unlike `wire:handled`, closing
+/// the connection without an answer fails: the HTTP message itself is valid.
+fn body_handled(result: &crate::execution::runner::StepResult) -> OracleEvaluation {
+    use crate::adapters::http::transport::TransportReason;
+    use crate::observation::SelectedValue;
+    let evaluation = |verdict, observed: String| OracleEvaluation {
+        verdict,
+        observed: Some(SelectedValue::Present(serde_json::Value::String(observed))),
+        reason: None,
+        schema_location: None,
+    };
+    match (&result.outcome, result.observation.as_ref().and_then(|observation| observation.http_status())) {
+        (StepOutcome::Completed, Some(status)) if (500..600).contains(&status) => {
+            evaluation(Verdict::Fail { category: super::ViolationCategory::ServerError }, format!("HTTP {status}"))
+        }
+        (StepOutcome::Completed, Some(status)) => evaluation(Verdict::Pass, format!("HTTP {status}")),
+        (StepOutcome::TransportError { transport_reason: Some(TransportReason::Timeout), .. }, _) => evaluation(
+            Verdict::Fail { category: super::ViolationCategory::Unresponsive },
+            "no answer before the timeout".into(),
+        ),
+        (StepOutcome::TransportError { transport_reason: Some(TransportReason::ConnectionClosed | TransportReason::Reset), .. }, _) => {
+            evaluation(
+                Verdict::Fail { category: super::ViolationCategory::Unresponsive },
+                "closed the connection without an answer".into(),
+            )
+        }
+        _ => OracleEvaluation { verdict: Verdict::Inconclusive, observed: None, reason: None, schema_location: None },
     }
 }
 
@@ -527,7 +622,129 @@ fn wire_handled(result: &crate::execution::runner::StepResult) -> OracleEvaluati
 
 #[cfg(test)]
 mod tests {
-    use super::RunStatus;
+    use super::{CliObservation, ProcessDiagnostic, RunStatus, StepObservation};
+    use crate::adapters::cli::ProcessStatusOperation;
+    use crate::execution::runner::{StepOutcome, StepResult};
+
+    fn cli_result(diagnostic: ProcessDiagnostic, ready: Option<bool>, timed_out: bool) -> StepResult {
+        StepResult {
+            step_id: "app".into(),
+            outcome: StepOutcome::Completed,
+            observation: Some(StepObservation::Cli(CliObservation {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out,
+                ready,
+                stopped_code: (ready == Some(true)).then_some(-1),
+                process_diagnostic: Some(diagnostic),
+            })),
+            extracted_outputs: Default::default(),
+            sensitive_response: false,
+            request_diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn cli_rules_distinguish_signals_from_unavailable_status() {
+        use super::{envfile_refuses, startup_defaults, startup_refuses, EnvFileEvidence, SelectedValue, Verdict};
+        use crate::adapters::cli::envbreak::Location;
+        use crate::evaluation::ViolationCategory::{AcceptedInvalidConfig, Crash, Unresponsive};
+
+        let evidence = EnvFileEvidence {
+            step_id: "app",
+            file: ".env",
+            name: "case",
+            location: Location::File,
+            token: None,
+        };
+        let status_error = ProcessDiagnostic::StatusError {
+            operation: ProcessStatusOperation::TryWait,
+            message: "child status unavailable".into(),
+            os_error: None,
+        };
+        let signal = ProcessDiagnostic::Signaled { signal: 15 };
+        for (run, verdict, detail) in [
+            (cli_result(signal.clone(), Some(false), false), Verdict::Fail { category: Crash }, "signal 15"),
+            (cli_result(status_error.clone(), None, false), Verdict::Inconclusive, "child status unavailable"),
+            (
+                cli_result(ProcessDiagnostic::SpawnError {
+                    message: "could not start the test command".into(),
+                    os_error: None,
+                }, Some(false), false),
+                Verdict::Inconclusive,
+                "could not start",
+            ),
+        ] {
+            for evaluation in [
+                startup_refuses(&run, "MODE", "invalid"),
+                startup_defaults(&run, "MODE"),
+                envfile_refuses(&run, evidence),
+            ] {
+                assert_eq!(evaluation.verdict, verdict);
+                assert!(matches!(
+                    evaluation.observed,
+                    Some(SelectedValue::Present(serde_json::Value::String(message)))
+                        if message.contains(detail)
+                ));
+            }
+        }
+        let ready = cli_result(signal, Some(true), false);
+        assert_eq!(startup_defaults(&ready, "MODE").verdict, Verdict::Pass);
+        assert_eq!(
+            envfile_refuses(&ready, evidence).verdict,
+            Verdict::Fail { category: AcceptedInvalidConfig },
+        );
+        let timed_out = cli_result(status_error, Some(false), true);
+        assert_eq!(
+            startup_refuses(&timed_out, "MODE", "invalid").verdict,
+            Verdict::Fail { category: Unresponsive },
+        );
+    }
+
+    #[test]
+    fn unavailable_status_is_incomplete_without_oracles_and_is_redacted_in_json() {
+        use super::{EvaluatedCase, ExecutedPlan};
+        use crate::execution::runner::CaseResult;
+        use serde_json::json;
+
+        let raw = crate::config::parse(r#"
+version: 1
+experiment:
+  name: process-diagnostic
+  max_cases: 1
+  protocols: {}
+  steps:
+    - {id: app, protocol: cli, command: [/bin/true]}
+"#).unwrap();
+        let experiment = crate::experiment::resolve_experiment(
+            raw, &Default::default(), std::path::Path::new("."),
+        ).unwrap();
+        let diagnostic = ProcessDiagnostic::StatusError {
+            operation: ProcessStatusOperation::TryWait,
+            message: "cannot wait for hidden-value".into(),
+            os_error: Some(10),
+        };
+        let case = EvaluatedCase::new(
+            &experiment,
+            CaseResult {
+                case_id: "case".into(),
+                step_results: vec![cli_result(diagnostic, None, false)],
+                was_executed: true,
+                requests_sent: 1,
+            },
+            ExecutedPlan::Baseline,
+            &Default::default(),
+        );
+        assert!(case.checks[0].is_empty());
+        assert_eq!(RunStatus::for_case(&case), RunStatus::Incomplete);
+        let record = crate::artifacts::regression_record(&experiment, &case, 0, &["hidden-value".into()]);
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(json["step_results"][0]["process_diagnostic"], json!({
+            "kind": "status_error", "operation": "try_wait",
+            "message": "cannot wait for [hidden]", "os_error": 10
+        }));
+    }
 
     #[test]
     fn classifies_combined_outcomes() {
@@ -557,6 +774,7 @@ mod tests {
                 timed_out,
                 ready: Some(ready),
                 stopped_code: ready.then_some(0),
+                process_diagnostic: None,
             })),
             extracted_outputs: Default::default(),
             sensitive_response: false,

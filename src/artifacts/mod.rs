@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 mod regression;
+mod replay_plan;
 
 use crate::exploration::RunStopReason;
 pub(crate) use regression::regression_record;
+pub(crate) use replay_plan::{ReplayPlan, SavedCase, SavedExample};
 
 // ── Run record ─────────────────────────────────────────────────────
 
@@ -196,6 +198,8 @@ pub struct StepResultRecord {
     /// Transport failure phase: "before_headers", "during_body_read".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_phase: Option<crate::adapters::http::transport::FailurePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_diagnostic: Option<crate::adapters::cli::ProcessDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +372,23 @@ mod tests {
             "artifact_version": 2,
             "case_id": "old-case",
             "case_number": 42,
-            "step_results": [],
+            "step_results": [{
+                "step_id": "app",
+                "outcome": "completed",
+                "status": null,
+                "body_sha256": null,
+                "extracted_outputs": {},
+                "oracle_verdicts": []
+            }],
             "coverage_snapshot_sha256": null
         });
         let record: CaseRecord = serde_json::from_value(json).unwrap();
         assert_eq!(record.case_id, "old-case");
         assert_eq!(record.case_number, 42);
         assert!(record.process_exit.is_none(), "missing field defaults to None");
+        assert!(record.step_results[0].process_diagnostic.is_none());
+        let serialized = serde_json::to_value(record).unwrap();
+        assert!(serialized["step_results"][0].get("process_diagnostic").is_none());
     }
 
     #[test]

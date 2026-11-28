@@ -47,7 +47,7 @@ El bloque `protocols.cli` es opcional: sin él, los pasos CLI usan el timeout po
 
 | Selector | Valor |
 |---|---|
-| `process.exit_code` | Código de salida del proceso (entero). `-1` si el proceso no se pudo lanzar o fue matado por una señal. |
+| `process.exit_code` | Código de salida del proceso (entero). `-1` cuando no hay código, por ejemplo si el proceso terminó por señal, venció el plazo o Nadir no pudo obtener su estado. |
 | `process.stdout` | Salida estándar completa (texto). |
 | `process.stderr` | Salida de error completa (texto). |
 | `process.timed_out` | `true` si se agotó `timeout_ms` (o `service.ready.timeout_ms`) y el proceso fue matado; `false` en caso contrario. |
@@ -57,7 +57,8 @@ El bloque `protocols.cli` es opcional: sin él, los pasos CLI usan el timeout po
 **Resultado de la ejecución:**
 - El comando se resuelve relativo al directorio del experimento. El proceso arranca en ese directorio, o en la carpeta de trabajo de `workdir`.
 - Cada caso copia el `env` base y reemplaza **una sola variable** con el valor de la variante.
-- Un código de salida distinto de cero es un resultado evaluable por los oráculos; un fallo al lanzar el proceso (`exit_code: -1`) se trata como error de ejecución.
+- Un código de salida distinto de cero es un resultado evaluable por los oráculos. Un fallo al lanzar el proceso o un timeout deja el caso inconcluso. Si un oráculo confirma un hallazgo, la ejecución se informa como fallida.
+- Si el proceso termina por una señal o falla la consulta de su estado, `debug` indica la causa y el JSON del caso la guarda en `process_diagnostic`. Un error de consulta antes de confirmar disponibilidad o de vencer el plazo deja el caso inconcluso.
 - Los valores marcados como `secret` en `outputs` o listados en [`hidden`](experiment.md#hidden-qué-se-oculta) se redactan de la salida.
 
 ## `env_file`, `workdir` y `service`: arrancar un servicio en cada caso

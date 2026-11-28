@@ -181,14 +181,18 @@ pub fn show(text: &str, secrets: &[String]) -> String {
 
 /// Replace every hidden value of at least four characters, longest first.
 pub fn redact(text: &str, secrets: &[String]) -> String {
-    let mut secrets: Vec<&String> = secrets
-        .iter()
+    redact_values(text, secrets.iter().map(String::as_str))
+}
+
+pub(crate) fn redact_values<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) -> String {
+    let mut secrets: Vec<_> = secrets
+        .into_iter()
         .filter(|secret| secret.chars().count() >= MIN_HIDDEN_LEN)
         .collect();
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     let mut output = text.to_owned();
     for secret in secrets {
-        output = output.replace(secret.as_str(), HIDDEN_PLACEHOLDER);
+        output = output.replace(secret, HIDDEN_PLACEHOLDER);
     }
     output
 }

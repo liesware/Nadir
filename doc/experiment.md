@@ -23,6 +23,7 @@ experiment:
       base_url: http://127.0.0.1:8080   # solo IPs loopback
       openapi: ./openapi.yaml           # ruta relativa al YAML del experimento
       timeout_ms: 2000                  # opcional, por defecto 2000
+      max_path_chars: 4096              # opcional: largo máximo de un parámetro de ruta aleatorio
     cli:
       timeout_ms: 5000                  # opcional, por defecto 5000
 
@@ -43,6 +44,8 @@ experiment:
       env:                       # protocol: cli — entorno inicial
         VAR: valor
 ```
+
+**`max_path_chars`** (solo `protocol: http`, de 1 a 65 534, por defecto 4096) limita el largo de los valores **aleatorios** de parámetros de ruta: las mutaciones que parten del catálogo o de tus `values` pueden crecer mucho, y codificadas con `%XX` armarían URLs más largas de lo que el cliente HTTP acepta (65 534 bytes). Con 4096 siempre caben; hasta 5461 también, porque un carácter ocupa como mucho 12 bytes codificado. Por encima, algunos casos pueden salir como `unsendable` (petición no enviable, no un fallo del servicio). Súbelo para apuntar al límite de URL del servicio (muchos responden `414` a partir de 8 KB). No afecta a los generadores (`alpha`, `raw`…, que usan su `length`), a los casos enumerados ni a `http_raw`, que escribe la petición byte a byte y no tiene ese límite.
 
 `protocol` selecciona cómo se comunica Nadir con el objetivo y `format` cómo procesa el contenido. Los nombres anteriores `adapters` y `adapter` siguen siendo válidos como alias de `protocols` y `protocol`. En cada nivel se escribe un solo nombre.
 
@@ -94,11 +97,13 @@ Findings: 1
 Stop reason: DeadlineExpired
 ```
 
+Si hubo casos aleatorios inconclusos y ningún hallazgo confirmado, la ejecución queda inconclusa y sale con código `2`.
+
 Los casos aleatorios no llevan la regla implícita `schema:rejects-invalid`, porque Nadir no sabe si el valor mutado es válido. Encuentran errores a través de tus reglas, de `openapi` (5xx, status no documentados) y de las caídas del `target`.
 
 ## `max_cases`: el presupuesto
 
-`max_cases` es el número máximo de ejecuciones del flujo, **contando el caso base**. Con `max_cases: 12` caben 1 caso base y 11 variantes o ejemplos. Con `strategy: fuzz`, `max_cases` solo limita la enumeración; la fase aleatoria tiene su propio presupuesto (`duration_s` y `max_execs`). Si se generan más variantes que espacios disponibles, las que sobran no se ejecutan y el motivo de parada es `MaxCasesReached`. Este motivo no cuenta como error, así que revisa la salida si esperabas cubrirlas todas. El máximo permitido es 1000. Los casos se guardan como `cases/0000.json` … `cases/0999.json`.
+`max_cases` es el número máximo de ejecuciones del flujo, **contando el caso base**. Con `max_cases: 12` caben 1 caso base y 11 variantes o ejemplos. Con `strategy: fuzz`, `max_cases` solo limita la enumeración; la fase aleatoria tiene su propio presupuesto (`duration_s` y `max_execs`). Si se generan más casos enumerados que espacios disponibles, los que sobran no se ejecutan (en el orden de la enumeración, lo último es `malform` y `envar`; ver el [mapa de capacidades](capabilities.md#2-mutadores-por-protocolo)). No cuenta como error, pero Nadir lo avisa: el progreso muestra `Enumeration cases: 40/185 · max_cases runs 99` desde el principio, y el resumen dice `Enumeration cases: 99 of 185 (max_cases reached: 86 enumerated cases did not run; raise max_cases)`, aunque después siga la fase aleatoria y el motivo de parada final sea otro. El máximo permitido es 1000. Los casos se guardan como `cases/0000.json` … `cases/0999.json`.
 
 ## Referencias `${...}`
 

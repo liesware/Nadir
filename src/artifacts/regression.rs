@@ -1,13 +1,14 @@
 //! Project evaluated workflows to the redacted artifact consumed by storage and the terminal.
 
 use super::{CaseRecord, StepResultRecord, VerdictRecord};
+use crate::adapters::cli::ProcessDiagnostic;
 use crate::evaluation::case::EvaluatedCase;
 use crate::evaluation::{resolve_expectation, Verdict};
 use crate::execution::runner::StepOutcome;
 use crate::experiment::selectors::{JsonPathSegment, ObservationSelector};
 use crate::experiment::types::{ExpectCondition, Experiment};
-use crate::inspect::HIDDEN_PLACEHOLDER;
-use crate::observation::SelectedValue;
+use crate::inspect::{redact_values, HIDDEN_PLACEHOLDER};
+use crate::observation::{SelectedValue, StepObservation};
 
 pub(crate) fn regression_record<'a>(
     experiment: &Experiment,
@@ -40,7 +41,12 @@ pub(crate) fn regression_record<'a>(
         .iter()
         .zip(&evaluated.checks)
         .map(|(step, checks)| {
+            let cli = step.observation.as_ref().and_then(StepObservation::as_cli);
             let outcome = match &step.outcome {
+                StepOutcome::Completed if cli.is_some_and(|run| run.timed_out) => "process_timeout",
+                StepOutcome::Completed if cli.is_some_and(|run| {
+                    matches!(run.process_diagnostic, Some(ProcessDiagnostic::SpawnError { .. }))
+                }) => "process_spawn_error",
                 StepOutcome::Completed
                     if step
                         .observation
@@ -188,6 +194,10 @@ pub(crate) fn regression_record<'a>(
                 } => (*reason, *phase),
                 _ => (None, None),
             };
+            let mut process_diagnostic = cli.and_then(|run| run.process_diagnostic.clone());
+            if let Some(message) = process_diagnostic.as_mut().and_then(ProcessDiagnostic::message_mut) {
+                *message = redact_values(message, secret_values.iter().copied());
+            }
             StepResultRecord {
                 step_id: step.step_id.clone(),
                 outcome: outcome.into(),
@@ -197,6 +207,7 @@ pub(crate) fn regression_record<'a>(
                 oracle_verdicts,
                 transport_reason,
                 transport_phase,
+                process_diagnostic,
             }
         })
         .collect();

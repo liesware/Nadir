@@ -150,10 +150,16 @@ impl ProgressDisplay {
             return;
         }
         let progress = &self.latest;
-        let mut lines = vec![format!(
-            "Enumeration cases: {}",
-            progress.deterministic_completed.saturating_sub(1),
-        )];
+        let done = progress.deterministic_completed.saturating_sub(1);
+        let mut enumeration = format!("Enumeration cases: {done}");
+        if progress.enumeration_planned > 0 {
+            enumeration.push_str(&format!("/{}", progress.enumeration_planned));
+            // Warn from the start when `max_cases` will cut it short.
+            if progress.enumeration_planned > progress.enumeration_slots {
+                enumeration.push_str(&format!(" · max_cases runs {}", progress.enumeration_slots));
+            }
+        }
+        let mut lines = vec![enumeration];
         if let (Some(random), Some(limit)) = (&progress.random, progress.random_limit) {
             lines.push(format!(
                 "Random cases: {}/{} (kept {}, seed {})",

@@ -155,7 +155,15 @@ pub struct HttpProtocolConfig {
     pub base_url: String,
     pub openapi_path: String,
     pub timeout_ms: u64,
+    /// Longest random path parameter value, in characters (`protocol: http`).
+    pub max_path_chars: usize,
 }
+
+/// Default `max_path_chars`: percent-encoded (at most 12 bytes per
+/// character) it always fits the 65 534 bytes the HTTP client accepts.
+pub const DEFAULT_MAX_PATH_CHARS: usize = 4096;
+/// Largest `max_path_chars`; above 5461 some cases may be unsendable.
+pub const MAX_PATH_CHARS_LIMIT: usize = 65_534;
 
 #[derive(Debug, Clone)]
 pub struct CliProtocolConfig {
@@ -258,6 +266,8 @@ pub enum ExampleAction {
 pub enum JsonExample {
     Rename { key: String, destination: String },
     Syntax { fixture: JsonSyntaxFixture },
+    /// `use: body`: random character edits on the serialized body.
+    Edits { edits: Vec<crate::mutation::body::BodyEdit> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -302,6 +312,20 @@ pub enum BindingValue {
     Literal(Value),
     Reference(Reference),
     Composite(Vec<CompositePart>),
+}
+
+impl BindingValue {
+    pub(crate) fn references(&self) -> impl Iterator<Item = &Reference> {
+        let (reference, parts) = match self {
+            Self::Reference(reference) => (Some(reference), &[][..]),
+            Self::Composite(parts) => (None, parts.as_slice()),
+            Self::Literal(_) => (None, &[][..]),
+        };
+        reference.into_iter().chain(parts.iter().filter_map(|part| match part {
+            CompositePart::Reference(reference) => Some(reference),
+            CompositePart::Literal(_) => None,
+        }))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +418,12 @@ pub enum MutatorDecl {
         /// `path`: one case per line (with `mode` `Lines`).
         lines: Option<ValueLines>,
     },
+    /// `use: body` (`protocol: http`, `strategy: fuzz`): random character
+    /// edits on the serialized JSON body.
+    Body {
+        alphabet: crate::mutation::text::Alphabet,
+        max_edits: usize,
+    },
     /// `use: envfile` (`protocol: cli` only): one case per way to break the
     /// `.env`-style `file` the working directory gets.
     EnvFile {
@@ -405,6 +435,7 @@ pub enum MutatorDecl {
     /// `use: malform` (`protocol: http_raw` only): one case per malformation.
     Malform {
         malformations: Vec<crate::adapters::http_raw::Malformation>,
+        sizes: crate::adapters::http_raw::MalformSizes,
     },
     /// `use: envar` (`protocol: cli` only): vary environment variables.
     Envar {

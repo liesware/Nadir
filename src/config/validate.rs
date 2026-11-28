@@ -9,6 +9,12 @@ use crate::config::types::{
     RawExperiment, RawExperimentBlock, RawExploration, RawStep, RawTarget,
 };
 
+use crate::experiment::cli_command::CliCommand;
+use crate::experiment::selectors::{
+    parse_binding_value, parse_full_observation_selector, parse_reference, Reference,
+};
+use crate::experiment::step_references::{StepReferenceError, StepReferences};
+
 /// Run static validation on a deserialized `RawExperiment`.
 pub fn validate_raw_experiment(raw: &RawExperiment) -> Result<(), String> {
     if raw.version != 1 {
@@ -151,53 +157,37 @@ fn validate_steps(steps: &[RawStep]) -> Result<(), String> {
         }
     }
 
-    // Check forward references: bindings/selectors that reference later steps
-    let step_id_set: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
-
-    for (idx, step) in steps.iter().enumerate() {
-        // Check auth references (bearer is always a reference string)
-        if let Some(auth) = &step.auth {
-            let val = serde_json::Value::String(auth.bearer.clone());
-            let values: Vec<&serde_json::Value> = vec![&val];
-            validate_binding_refs(
-                &step.id,
-                &values,
-                idx,
-                steps,
-                &step_id_set,
-            )?;
+    let references = StepReferences::new(steps);
+    for (position, step) in steps.iter().enumerate() {
+        if let Some(Ok(reference)) = step.auth.as_ref().and_then(|auth| parse_reference(&auth.bearer)) {
+            validate_binding_reference(&references, position, &step.id, &reference)?;
         }
 
-        // Check bind references
-        if let Some(bind_map) = &step.bind {
-            // Collect all values from the bind map
-            let values: Vec<&serde_json::Value> = bind_map.values().collect();
-            validate_binding_refs(&step.id, &values, idx, steps, &step_id_set)?;
+        let bindings = step.bind.iter().flat_map(|bindings| bindings.values());
+        for value in bindings.filter(|value| value.as_str().is_some_and(|text| text.contains("${"))) {
+            let Ok(binding) = parse_binding_value(value).into_binding_value() else {
+                continue;
+            };
+            for reference in binding.references() {
+                validate_binding_reference(&references, position, &step.id, reference)?;
+            }
         }
 
-        // Check oracle selectors
         for oracle in &step.oracles {
-            // Check `when.select` for step references
-            if let Some(when_block) = &oracle.r#when {
-                if when_block.select.starts_with("steps.") {
-                    validate_step_ref_in_selector(
-                        &step.id,
-                        &when_block.select,
-                        idx,
-                        &step_id_set,
-                    )?;
-                }
-            }
-            // Check `select` for step references
-            if let Some(select) = &oracle.select {
-                if select.starts_with("steps.") {
-                    validate_step_ref_in_selector(&step.id, select, idx, &step_id_set)?;
-                }
-            }
-            // Check `record_reference`
-            if let Some(rr) = &oracle.record_reference {
-                if rr.starts_with("steps.") {
-                    validate_step_ref_in_selector(&step.id, rr, idx, &step_id_set)?;
+            let selectors = [
+                oracle.r#when.as_ref().map(|when| when.select.as_str()),
+                oracle.select.as_deref(),
+                oracle.record_reference.as_deref(),
+            ];
+            for selector in selectors.into_iter().flatten() {
+                let Ok((Some(referenced), _)) = parse_full_observation_selector(selector) else {
+                    continue;
+                };
+                if !references.contains(&referenced) {
+                    return Err(format!(
+                        "step '{}': selector '{selector}' references unknown step '{referenced}'",
+                        step.id
+                    ));
                 }
             }
         }
@@ -307,6 +297,14 @@ fn validate_steps(steps: &[RawStep]) -> Result<(), String> {
             if mutator.r#use == "envfile" {
                 validate_envfile_mutator(step, mutator)?;
             }
+            if mutator.r#use == "body" {
+                validate_body_mutator(step, mutator)?;
+            } else if mutator.edits.is_some() {
+                return Err(format!("step '{}': edits is an option of use: body", step.id));
+            }
+            if mutator.r#use != "malform" && mutator.sizes.is_some() {
+                return Err(format!("step '{}': sizes is an option of use: malform", step.id));
+            }
             if mutator.r#use != "envfile"
                 && (mutator.file.is_some() || mutator.limits.is_some() || mutator.prohibited.is_some())
             {
@@ -325,11 +323,42 @@ fn validate_cli_step(step: &RawStep) -> Result<(), String> {
     if step.env_file.as_deref().is_some_and(str::is_empty) {
         return Err(format!("step '{}': env_file must not be empty", step.id));
     }
-    if step.command.as_ref().map_or(true, |cmd| cmd.is_empty()) {
+    CliCommand::parse(step.command.as_deref())
+        .map(|_| ())
+        .map_err(|error| format!("step '{}': {error}", step.id))
+}
+
+/// `use: body`: an http step, a text mode and at most `edits`.
+fn validate_body_mutator(step: &RawStep, mutator: &crate::config::types::RawMutator) -> Result<(), String> {
+    if step.protocol != "http" {
         return Err(format!(
-            "step '{}': protocol 'cli' requires a non-empty 'command' list",
-            step.id
+            "step '{}': mutator 'use: body' requires protocol 'http', found '{}'",
+            step.id, step.protocol
         ));
+    }
+    if let Some(mode) = mutator.mode.as_deref() {
+        if !["alpha", "alphanum", "num", "raw"].contains(&mode) {
+            return Err(format!("step '{}': use: body takes mode: alpha, alphanum, num or raw (found {mode})", step.id));
+        }
+    }
+    if mutator.edits.is_some_and(|edits| edits.max == 0 || edits.max > 64) {
+        return Err(format!("step '{}': body edits.max must be between 1 and 64", step.id));
+    }
+    let foreign = [
+        ("fields", mutator.fields.is_some()),
+        ("values", mutator.values.is_some()),
+        ("length", mutator.length.is_some()),
+        ("path", mutator.path.is_some()),
+        ("keys", mutator.keys.is_some()),
+        ("rename_to", mutator.rename_to.is_some()),
+        ("expect_status", mutator.expect_status.is_some()),
+        ("seed", mutator.seed.is_some()),
+        ("repetitions", mutator.repetitions.is_some()),
+        ("variables", mutator.variables.is_some()),
+        ("only", mutator.only.is_some()),
+    ];
+    if let Some((name, _)) = foreign.iter().find(|(_, present)| *present) {
+        return Err(format!("step '{}': '{name}' does not apply to 'use: body'", step.id));
     }
     Ok(())
 }
@@ -592,84 +621,24 @@ fn validate_example_ids(step_id: &str, examples: &[crate::config::types::RawExam
     Ok(())
 }
 
-/// Check that references in binding values don't reference future steps.
-fn validate_binding_refs(
+fn validate_binding_reference(
+    references: &StepReferences<'_>,
+    position: usize,
     step_id: &str,
-    values: &[&serde_json::Value],
-    current_idx: usize,
-    steps: &[RawStep],
-    step_id_set: &HashSet<&str>,
+    reference: &Reference,
 ) -> Result<(), String> {
-    for value in values {
-        if let serde_json::Value::String(s) = value {
-            // Check for ${steps.X...} references
-            for ref_match in extract_step_refs(s) {
-                if !step_id_set.contains(ref_match.as_str()) {
-                    return Err(format!(
-                        "step '{}' references unknown step '{}'",
-                        step_id, ref_match
-                    ));
-                }
-                // Find the index of the referenced step
-                if let Some(ref_idx) = steps.iter().position(|s| s.id == ref_match) {
-                    if ref_idx >= current_idx {
-                        return Err(format!(
-                            "step '{}' has a forward reference to step '{}' (referenced step must be declared earlier)",
-                            step_id, ref_match
-                        ));
-                    }
-                }
-            }
+    let Reference::StepOutput { step_id: referenced, .. } = reference else {
+        return Ok(());
+    };
+    match references.check(position, referenced, false) {
+        Ok(_) => Ok(()),
+        Err(StepReferenceError::Unknown) => {
+            Err(format!("step '{step_id}' references unknown step '{referenced}'"))
         }
+        Err(StepReferenceError::Forward) => Err(format!(
+            "step '{step_id}' has a forward reference to step '{referenced}' (referenced step must be declared earlier)"
+        )),
     }
-    Ok(())
-}
-
-/// Check that a `steps.<id>.response.<...>` selector references a valid, earlier step.
-fn validate_step_ref_in_selector(
-    step_id: &str,
-    selector: &str,
-    _current_idx: usize,
-    step_id_set: &HashSet<&str>,
-) -> Result<(), String> {
-    // Extract step id from "steps.<id>..."
-    if let Some(rest) = selector.strip_prefix("steps.") {
-        let ref_step_id = rest.split('.').next().unwrap_or("");
-        if !step_id_set.contains(ref_step_id) {
-            return Err(format!(
-                "step '{}': selector '{}' references unknown step '{}'",
-                step_id, selector, ref_step_id
-            ));
-        }
-        // Forward reference check (but we don't have the index here easily)
-        // The caller ensures this is checked in validate_binding_refs
-    }
-    Ok(())
-}
-
-/// Extract all `${steps.<id>...}` references from a string.
-fn extract_step_refs(s: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    let mut search_from = 0;
-    while let Some(pos) = s[search_from..].find("${steps.") {
-        let abs_pos = search_from + pos;
-        let after = &s[abs_pos + 2..]; // skip ${
-        if let Some(close) = after.find('}') {
-            let inner = &after[..close];
-            // inner looks like "steps.login.outputs.token"
-            // Extract the step id between "steps." and the next "."
-            if let Some(after_steps) = inner.strip_prefix("steps.") {
-                if let Some(dot_pos) = after_steps.find('.') {
-                    let step_id = &after_steps[..dot_pos];
-                    refs.push(step_id.to_string());
-                }
-            }
-            search_from = abs_pos + 2 + close + 1;
-        } else {
-            break;
-        }
-    }
-    refs
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -751,6 +720,44 @@ mod tests {
             version: 1,
             experiment: block,
         })
+    }
+
+    #[test]
+    fn rejects_duplicate_example_ids_within_a_step() {
+        let mut step = make_step("submit");
+        step.cases = Some(RawStepCases {
+            mutators: vec![],
+            examples: ["first", "second"]
+                .into_iter()
+                .map(|value| RawExample {
+                    id: "duplicate".into(),
+                    field: Some("title".into()),
+                    value: Some(value.into()),
+                    syntax: None,
+                    expect_status: 200,
+                })
+                .collect(),
+        });
+
+        assert_eq!(
+            validate_step(step).unwrap_err(),
+            "step 'submit': duplicate example id 'duplicate'",
+        );
+    }
+
+    #[test]
+    fn rejects_bind_reference_to_an_unknown_step() {
+        let mut step = make_step("submit");
+        step.bind = Some(
+            [("body.token".into(), "${steps.missing.outputs.token}".into())]
+                .into_iter()
+                .collect(),
+        );
+
+        assert_eq!(
+            validate_step(step).unwrap_err(),
+            "step 'submit' references unknown step 'missing'",
+        );
     }
 
     fn step_with_bind_and_mutator(bind_key: &str, mutator: &str, field: &str) -> RawStep {
@@ -1091,6 +1098,7 @@ mod tests {
             base_url: "http://127.0.0.1:8080".into(),
             openapi: "openapi.yaml".into(),
             timeout_ms: 2000,
+            max_path_chars: None,
         });
         let mut step = make_step("http-step");
         step.cases = Some(RawStepCases {

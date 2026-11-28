@@ -1235,13 +1235,19 @@ fn stopping_from_debug_discards_the_pending_case_and_keeps_the_rest() {
     let experiment = workspace.prepare(&service, 20, json!([{
         "id":"preview", "protocol":"http", "operation_id":"preview",
         "body_example":{"title":"x"}, "debug": {"auto": 1},
-        "cases":{"mutators":[{"use":"json", "fields":["title"]}]}
+        "cases":{
+            "mutators":[{"use":"json", "fields":["title"]}],
+            "examples":[{"id":"later-example", "field":"title", "value":"later", "expect_status":200}]
+        }
     }]), preview_operation());
     let configuration = nadir::config::load_resolved(&experiment).unwrap();
     let mut runner = WorkflowRunner::new(configuration.experiment.clone(), configuration.contracts).unwrap();
     runner.set_inspector(Some(Box::new(StopAtThird(0))));
-    let result = run_enumeration(&mut runner, &configuration.experiment, &mut RunBudget::new(20, None, None)).unwrap();
+    let mut budget = RunBudget::new(20, None, None);
+    let result = run_enumeration(&mut runner, &configuration.experiment, &mut budget).unwrap();
     assert_eq!(result.stop_reason, RunStopReason::StoppedByUser);
+    assert!(!result.phase_completed);
+    assert_eq!(budget.cases_executed(), 2);
     assert_eq!(result.cases.len(), 1);
     assert_eq!(*requests.lock().unwrap(), 2);
 }
@@ -1298,6 +1304,9 @@ fn http_mutator_replaces_bound_headers_removes_them_and_encodes_path_values() {
     // Path values travel encoded as one segment, with the bound key.
     assert!(requests.iter().any(|(path, keys)| path == "/items/%3C%2Fscript%3E" && keys == &["good-key"]), "{requests:?}");
     assert!(requests.iter().any(|(path, _)| path == "/items/%00"), "{requests:?}");
+    // huge_uppercase makes a URL longer than the client accepts: unsendable,
+    // not a connection failure of the service.
+    assert!(text.contains("transport_error (unsendable)") && !text.contains("connection_failed"), "{text}");
 
     let crashes: Vec<PathBuf> = fs::read_dir(workspace.0.join("artifacts/crashes"))
         .unwrap()
@@ -1398,6 +1407,132 @@ fn json_and_http_take_num_and_value_files() {
 }
 
 #[test]
+fn body_mutator_breaks_the_serialized_json_and_judges_the_answer() {
+    let workspace = Workspace::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    // Rejects broken JSON with 400, but answers 500 to a body with a backslash.
+    let service = Service::start(move |request| {
+        captured.lock().unwrap().push((request.raw_body.clone(), request.content_type.clone()));
+        let status = if request.raw_body.contains(&b'\\') {
+            500
+        } else if request.body.is_object() {
+            200
+        } else {
+            400
+        };
+        Some(Reply::json(status, json!({})))
+    });
+    let experiment = workspace.prepare(&service, 10, json!([{
+        "id":"preview", "protocol":"http", "operation_id":"preview", "print": true,
+        "cases":{"mutators":[{"use":"body", "mode":"alpha", "edits":{"max":3}}]},
+        "oracles":[{"id":"accepted", "use":"assert", "select":"response.status", "expect":{"equals":200}}]
+    }]), json!({"/preview":operation("post", "preview", json!({"200":{"description":"OK"}}))}));
+    let mut document = read_json(&experiment);
+    document["experiment"]["exploration"] = json!({"strategy":"fuzz","duration_s":10,"max_execs":80,"seed":9});
+    fs::write(&experiment, document.to_string()).unwrap();
+    stderr(call("validate", &experiment, None), 0);
+    let text = stderr(call("run", &experiment, None), 1);
+
+    assert!(text.contains("body: random edits (alpha, 1 to 3 per case: insert, delete, replace, duplicate)"), "{text}");
+    let requests = seen.lock().unwrap().clone();
+    let baseline = br#"{"title":"baseline"}"#.to_vec();
+    assert_eq!(requests[0].0, baseline);
+    // Edited bodies, still sent as JSON; most no longer parse.
+    let edited: Vec<&Vec<u8>> = requests.iter().skip(1).map(|(body, _)| body).filter(|body| **body != baseline).collect();
+    assert!(edited.len() > 40, "{}", edited.len());
+    assert!(edited.iter().filter(|body| serde_json::from_slice::<Value>(body).is_err()).count() > 20);
+    assert!(requests.iter().all(|(_, content_type)| content_type.as_deref() == Some("application/json")));
+    // A 400 is a handled answer; the 500 is the finding, and the step's own
+    // oracle (expecting 200) does not judge edited bodies.
+    assert!(text.contains("rule body:handled: fail") && text.contains("observed \"HTTP 500\""), "{text}");
+    assert!(!text.contains("rule accepted: fail"), "{text}");
+    let crashes: Vec<PathBuf> = fs::read_dir(workspace.0.join("artifacts/crashes")).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert!(!crashes.is_empty());
+    let before = seen.lock().unwrap().len();
+    stderr(call("replay", &experiment, Some(&crashes[0])), 1);
+    // The replayed body is the same broken one.
+    let requests = seen.lock().unwrap().clone();
+    assert!(requests[before..].iter().any(|(body, _)| body.contains(&b'\\')), "{:?}", &requests[before..]);
+
+    // Without strategy: fuzz there is nothing to run.
+    document["experiment"]["exploration"] = json!({"strategy":"enumerate"});
+    fs::write(&experiment, document.to_string()).unwrap();
+    assert!(stderr(call("validate", &experiment, None), 2).contains("requires strategy: fuzz"));
+}
+
+#[test]
+fn random_path_values_respect_max_path_chars() {
+    let workspace = Workspace::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let service = Service::start(move |request| {
+        captured.lock().unwrap().push(request.path);
+        Some(Reply::json(200, json!({})))
+    });
+    let experiment = workspace.prepare(&service, 10, json!([{
+        "id":"item", "protocol":"http", "operation_id":"getItem",
+        "bind":{"path.id":"abc"},
+        "cases":{"mutators":[{"use":"http", "fields":["path.id"], "mode":"values", "values":["abcdef"]}]}
+    }]), items_operation());
+    let mut document = read_json(&experiment);
+    document["experiment"]["adapters"]["http"]["max_path_chars"] = json!(8);
+    document["experiment"]["exploration"] = json!({"strategy":"fuzz","duration_s":10,"max_execs":80,"seed":2});
+    fs::write(&experiment, document.to_string()).unwrap();
+    stderr(call("run", &experiment, None), 0);
+    // Percent-decoded, no random segment is longer than 8 characters.
+    let decode = |segment: &str| {
+        let bytes = segment.as_bytes();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                out.push(u8::from_str_radix(&segment[index + 1..index + 3], 16).unwrap());
+                index += 3;
+            } else {
+                out.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).chars().count()
+    };
+    let paths = seen.lock().unwrap().clone();
+    let lengths: Vec<usize> = paths.iter().filter_map(|path| path.strip_prefix("/items/")).map(decode).collect();
+    assert!(lengths.len() > 40 && lengths.iter().all(|length| *length <= 8), "{lengths:?}");
+    assert!(lengths.iter().any(|length| *length != 3 && *length != 6), "random cases changed the value: {lengths:?}");
+
+    document["experiment"]["adapters"]["http"]["max_path_chars"] = json!(0);
+    fs::write(&experiment, document.to_string()).unwrap();
+    assert!(stderr(call("validate", &experiment, None), 2).contains("max_path_chars must be between 1 and 65534"));
+}
+
+#[test]
+fn a_max_cases_cut_is_reported_even_when_the_random_phase_follows() {
+    let workspace = Workspace::new();
+    let service = Service::start(move |_| Some(Reply::json(200, json!({"ok": true}))));
+    // edge_cases on one field: 5 enumerated cases.
+    let experiment = workspace.prepare(&service, 3, json!([{
+        "id":"preview", "protocol":"http", "operation_id":"preview",
+        "cases":{"mutators":[{"use":"json", "fields":["title"], "mode":"edge_cases"}]}
+    }]), json!({"/preview":operation("post", "preview", json!({"200":{"description":"OK"}}))}));
+    let mut document = read_json(&experiment);
+    document["experiment"]["exploration"] = json!({"strategy":"fuzz","duration_s":10,"max_execs":5,"seed":1});
+    fs::write(&experiment, document.to_string()).unwrap();
+    // max_cases 3: the baseline and 2 of the 5; the random phase still runs.
+    let text = stderr(call("run", &experiment, None), 0);
+    assert!(
+        text.contains("Enumeration cases: 2 of 5 (max_cases reached: 3 enumerated cases did not run; raise max_cases)"),
+        "{text}"
+    );
+    assert!(text.contains("Stop reason: MaxExecsReached"), "{text}");
+
+    document["experiment"]["max_cases"] = json!(20);
+    fs::write(&experiment, document.to_string()).unwrap();
+    let text = stderr(call("run", &experiment, None), 0);
+    assert!(text.contains("Enumeration cases: 5\n"), "{text}");
+}
+
+#[test]
 fn http_mutator_fields_are_checked() {
     let workspace = Workspace::new();
     let service = Service::start(move |_| Some(Reply::json(200, json!({}))));
@@ -1424,6 +1559,10 @@ fn http_mutator_fields_are_checked() {
     check(json!({"use":"http", "fields":["header.X-Key"], "path":"./missing.txt"}), "path './missing.txt'");
     check(json!({"use":"http", "fields":["header.X-Key"], "path":"./x.txt", "mode":"raw"}), "path takes no mode or length");
     check(json!({"use":"headers", "fields":["X-Key"], "path":"./x.txt"}), "path is not an option of use: headers");
+    check(json!({"use":"body", "fields":["title"]}), "'fields' does not apply to 'use: body'");
+    check(json!({"use":"body", "mode":"edge_cases"}), "use: body takes mode: alpha, alphanum, num or raw");
+    check(json!({"use":"body", "edits":{"max":0}}), "edits.max must be between 1 and 64");
+    check(json!({"use":"json", "fields":["title"], "edits":{"max":2}}), "edits is an option of use: body");
 }
 
 #[test]
@@ -1674,6 +1813,396 @@ fn http_raw_and_malform_only_go_together() {
         "unknown malformation 'nope' (expected one of: bad_method,");
     check(base("http_raw", json!({"cases":{"mutators":[{"use":"malform", "mode":"random"}]}})),
         "malform mode: random is available in a later phase");
+    check(base("http_raw", json!({"cases":{"mutators":[{"use":"malform", "sizes":{"uri":0}}]}})),
+        "malform sizes.uri must be between 1 and");
+    check(base("http", json!({"cases":{"mutators":[{"use":"json", "fields":["hex"], "sizes":{"uri":10}}]}})),
+        "sizes is an option of use: malform");
+}
+
+#[test]
+fn malform_sizes_aim_the_big_cases_at_a_chosen_limit() {
+    let workspace = Workspace::new();
+    let service = RawService::start(|_| {
+        Some(b"HTTP/1.1 414 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec())
+    });
+    let experiment = workspace.prepare(&RawOrigin(&service.origin), 10, json!([
+        {"id":"axum", "protocol":"http_raw", "operation_path":"/sign/{kid}.post", "print": true,
+         "body_example":{"hex":"abcd"}, "bind":{"path.kid":"k1"},
+         "cases":{"mutators":[{"use":"malform", "only":["huge_uri","huge_header","many_headers"],
+                               "sizes":{"uri":300, "header":500, "headers":7}}]}}
+    ]), wire_operation());
+    let text = stderr(call("run", &experiment, None), 0);
+    assert!(text.contains("malform sizes: uri 300 bytes, header 500 bytes, 7 headers"), "{text}");
+    let requests: Vec<String> = service.seen.lock().unwrap().iter().map(|r| String::from_utf8_lossy(r).into_owned()).collect();
+    assert_eq!(requests.len(), 4, "baseline plus three");
+    let target = |request: &String| request.lines().next().unwrap().split(' ').nth(1).unwrap().to_owned();
+    assert!(requests.iter().any(|request| target(request).len() == 300), "{:?}", requests.iter().map(target).collect::<Vec<_>>());
+    assert!(requests.iter().any(|request| request.contains(&format!("X-Nadir: {}\r\n", "A".repeat(500)))));
+    assert!(requests.iter().any(|request| request.matches("\r\nX-Nadir-").count() == 7));
+}
+
+fn cli_command_experiment(step: Value) -> Value {
+    json!({
+        "version": 1,
+        "experiment": {
+            "name": "cli-command",
+            "max_cases": 1,
+            "protocols": {},
+            "steps": [step],
+        },
+    })
+}
+
+#[test]
+fn cli_signal_keeps_numeric_exit_code_and_records_the_signal() {
+    let workspace = Workspace::new();
+    let document = cli_command_experiment(json!({
+        "id": "app",
+        "protocol": "cli",
+        "command": ["/bin/sh", "-c", "kill -s TERM \"$$\""],
+        "debug": true,
+        "oracles": [{
+            "id": "legacy-exit-code", "use": "assert",
+            "select": "process.exit_code", "expect": {"equals": -1},
+        }],
+    }));
+    let experiment = workspace.write("experiment.yaml", &document);
+    let output = stderr(call("run", &experiment, None), 0);
+    assert!(output.contains("result: terminated by signal 15"), "{output}");
+    let run = read_json(&record_path(&output, "Run record: "));
+    let step = &run["baseline_case"]["step_results"][0];
+    assert_eq!(step["process_diagnostic"], json!({"kind": "signaled", "signal": 15}));
+    assert_eq!(step["oracle_verdicts"][0]["verdict"], "pass");
+}
+
+#[test]
+fn cli_spawn_failure_is_incomplete_and_redacted() {
+    let workspace = Workspace::new();
+    let document = cli_command_experiment(json!({
+        "id": "app",
+        "protocol": "cli",
+        "command": ["./missing-hidden-value"],
+        "env": {"PRIVATE": "hidden-value"},
+        "debug": true,
+    }));
+    let mut document = document;
+    document["experiment"]["hidden"] = json!(["PRIVATE"]);
+    let experiment = workspace.write("experiment.yaml", &document);
+    let output = stderr(call("run", &experiment, None), 2);
+    assert!(output.contains("could not start") && output.contains("[hidden]"), "{output}");
+    assert!(!output.contains("hidden-value"), "{output}");
+    let record = read_json(&record_path(&output, "Run record: "));
+    assert_eq!(record["status"], "incomplete");
+    let step = &record["baseline_case"]["step_results"][0];
+    assert_eq!(step["outcome"], "process_spawn_error");
+    assert_eq!(step["process_diagnostic"]["kind"], "spawn_error");
+    assert!(step["process_diagnostic"]["message"].as_str().unwrap().contains("[hidden]"));
+    assert!(!step.to_string().contains("hidden-value"), "{step}");
+}
+
+#[test]
+fn cli_timeout_cannot_pass_and_a_confirmed_failure_remains_failed() {
+    let workspace = Workspace::new();
+    for (expect_timeout, exit, status, verdict) in [
+        (None, 2, "incomplete", None),
+        (Some(true), 2, "incomplete", Some("pass")),
+        (Some(false), 1, "failed", Some("fail")),
+    ] {
+        let mut step = json!({
+            "id": "app", "protocol": "cli", "command": ["/bin/sleep", "1"],
+        });
+        if let Some(expected) = expect_timeout {
+            step["oracles"] = json!([{
+                "id": "timeout-check", "use": "assert",
+                "select": "process.timed_out", "expect": {"equals": expected},
+            }]);
+        }
+        let mut document = cli_command_experiment(step);
+        document["experiment"]["protocols"]["cli"] = json!({"timeout_ms": 40});
+        let experiment = workspace.write("experiment.yaml", &document);
+        let output = stderr(call("run", &experiment, None), exit);
+        let record = read_json(&record_path(&output, "Run record: "));
+        assert_eq!(record["status"], status);
+        let step = &record["baseline_case"]["step_results"][0];
+        assert_eq!(step["outcome"], "process_timeout");
+        assert_eq!(step["oracle_verdicts"][0]["verdict"].as_str(), verdict);
+    }
+}
+
+#[test]
+fn unretained_incomplete_random_cases_affect_run_status() {
+    let workspace = Workspace::new();
+    for (confirmed_failure, exit, status, kept, incomplete) in [
+        (false, 2, "incomplete", 0, 2),
+        (true, 1, "failed", 1, 1),
+    ] {
+        let script = if confirmed_failure {
+            r#"if [ "$LABEL" = baseline ]; then exit 0; fi
+if [ -e first-random-case ]; then exit 1; fi
+: > first-random-case
+exec /bin/sleep 1"#
+        } else {
+            r#"if [ "$LABEL" = baseline ]; then exit 0; fi
+exec /bin/sleep 1"#
+        };
+        let document = cli_command_experiment(json!({
+            "id": "app", "protocol": "cli", "command": ["/bin/sh", "-c", script],
+            "env": {"LABEL": "baseline"},
+            "cases": {"mutators": [{"use": "envar", "variables": ["LABEL"], "mode": "num"}]},
+            "oracles": [{
+                "id": "normal-exit", "use": "assert",
+                "when": {"select": "process.timed_out", "equals": false},
+                "select": "process.exit_code", "expect": {"equals": 0},
+            }],
+        }));
+        let mut document = document;
+        document["experiment"]["protocols"]["cli"] = json!({"timeout_ms": 80});
+        document["experiment"]["exploration"] = json!({
+            "strategy": "fuzz", "seed": 7, "max_execs": 2, "duration_s": 5,
+        });
+        let experiment = workspace.write("experiment.yaml", &document);
+        let output = stderr(call("run", &experiment, None), exit);
+        assert!(output.contains("Stop reason: MaxExecsReached"), "{output}");
+        let record = read_json(&record_path(&output, "Run record: "));
+        assert_eq!(record["status"], status);
+        assert_eq!(record["fuzz"]["executed"], 2);
+        assert_eq!(record["fuzz"]["incomplete"], incomplete);
+        assert_eq!(record["fuzz"]["kept"], kept);
+        assert_eq!(record["cases"].as_array().unwrap().len(), kept);
+    }
+}
+
+#[test]
+fn invalid_assertions_are_rejected_before_running_a_step() {
+    let workspace = Workspace::new();
+    for (select, expect, expected_field) in [
+        (None, Some(json!({"equals": 0})), "select"),
+        (Some("process.exit_code"), None, "expect"),
+        (Some("process.exit_code"), Some(json!({})), "expect"),
+        (Some("process.exit_code"), Some(json!({"equals": 0, "exists": true})), "expect"),
+        (Some("process.exit_code"), Some(json!({"one_of": []})), "expect"),
+        (Some("process.exit_code"), Some(json!({"exists": false})), "expect"),
+        (Some("process.exit_code"), Some(json!({"absent": false})), "expect"),
+        (Some("response.status"), Some(json!({"equals": 200})), "select"),
+    ] {
+        let mut oracle = json!({"id": "bad-assertion", "use": "assert"});
+        if let Some(select) = select {
+            oracle["select"] = json!(select);
+        }
+        if let Some(expect) = expect {
+            oracle["expect"] = expect;
+        }
+        let document = cli_command_experiment(json!({
+            "id": "app", "protocol": "cli",
+            "command": ["/bin/sh", "-c", ": > executed"],
+            "oracles": [oracle],
+        }));
+        let experiment = workspace.write("experiment.yaml", &document);
+        for command in ["validate", "run"] {
+            let output = stderr(call(command, &experiment, None), 2);
+            assert!(output.contains("step 'app'") && output.contains("oracle 'bad-assertion'"), "{output}");
+            assert!(output.contains(&format!("{expected_field}:")), "{output}");
+        }
+        let raw = serde_yaml::from_str(&document.to_string()).unwrap();
+        assert!(nadir::experiment::resolve_experiment(raw, &Default::default(), &workspace.0).is_err());
+        assert!(!workspace.0.join("executed").exists());
+    }
+}
+
+#[test]
+fn selectors_are_checked_against_the_observed_step_and_equals_null_is_literal() {
+    let workspace = Workspace::new();
+    let service = Service::start(|_| Some(Reply::json(200, json!({"value": null}))));
+    let steps = json!([
+        {"id": "app", "protocol": "cli", "command": ["/bin/true"]},
+        {
+            "id": "web", "protocol": "http", "operation_id": "preview",
+            "oracles": [{
+                "id": "null-check", "use": "assert", "select": "response.body.value",
+                "expect": {"equals": null},
+                "when": {"select": "steps.app.response.process.exit_code", "equals": 0},
+            }],
+        },
+        {
+            "id": "last", "protocol": "cli", "command": ["/bin/true"],
+            "oracles": [{
+                "id": "cross-check", "use": "assert", "select": "steps.web.response.status",
+                "expect": {"equals": 200},
+            }],
+        },
+    ]);
+    let experiment = workspace.prepare(&service, 1, steps, preview_operation());
+    let valid = read_json(&experiment);
+    let output = stderr(call("run", &experiment, None), 0);
+    let record = read_json(&record_path(&output, "Run record: "));
+    let results = &record["baseline_case"]["step_results"];
+    assert_eq!(results[1]["oracle_verdicts"][0]["verdict"], "pass");
+    assert_eq!(results[2]["oracle_verdicts"][0]["verdict"], "pass");
+
+    for (path, replacement, expected) in [
+        ("/1/oracles/0/when/select", json!("steps.app.response.status"), "oracle 'null-check' when.select"),
+        ("/2/oracles/0/select", json!("steps.web.response.process.exit_code"), "oracle 'cross-check' select"),
+        ("/0", json!({
+            "id": "app", "protocol": "cli", "command": ["/bin/true"],
+            "outputs": {"result": {"from": "response.body.value"}},
+        }), "outputs.result.from"),
+        ("/1/oracles/0", json!({
+            "id": "record-check", "use": "record_absent", "record_reference": "process.stdout",
+        }), "oracle 'record-check' record_reference"),
+        ("/2/oracles/0", json!({"id": "schema-check", "use": "openapi_schema"}), "oracle 'schema-check' use"),
+    ] {
+        let mut bad = valid.clone();
+        *bad["experiment"]["steps"].pointer_mut(path).unwrap() = replacement;
+        let path = workspace.write("invalid.yaml", &bad);
+        let output = stderr(call("validate", &path, None), 2);
+        assert!(output.contains(expected), "{output}");
+    }
+}
+
+#[test]
+fn deterministic_limits_report_stop_reason_and_keep_case_numbers() {
+    let workspace = Workspace::new();
+    let mut document = cli_command_experiment(json!({
+        "id": "app",
+        "protocol": "cli",
+        "command": ["/bin/true"],
+        "env": {"LABEL": "baseline"},
+        "cases": {"mutators": [{"use": "envar", "variables": ["LABEL"], "values": ["one", "two"]}]},
+    }));
+
+    for (limit, expected) in [(3, "EnumerationComplete"), (2, "MaxCasesReached")] {
+        document["experiment"]["max_cases"] = json!(limit);
+        let path = workspace.write("experiment.yaml", &document);
+        let output = stderr(call("run", &path, None), 0);
+        assert!(output.contains(&format!("Stop reason: {expected}")), "{output}");
+        assert!(output.contains(&format!("Cases: {limit}/{limit}")), "{output}");
+        let run_file = record_path(&output, "Run record: ");
+        let cases = run_file.parent().unwrap().join("cases");
+        assert_eq!(fs::read_dir(&cases).unwrap().count(), limit);
+        for number in 0..limit {
+            let record = read_json(&cases.join(format!("{number:04}.json")));
+            assert_eq!(record["case_number"], json!(number));
+            if number > 0 {
+                assert_eq!(record["regression_plan"]["envar"]["case"]["value"], json!(number - 1));
+            }
+        }
+    }
+}
+
+#[test]
+fn expired_deadline_records_only_the_baseline() {
+    use nadir::execution::WorkflowRunner;
+    use nadir::exploration::{run_enumeration, RunBudget, RunStopReason};
+
+    let workspace = Workspace::new();
+    let mut document = cli_command_experiment(json!({
+        "id": "app",
+        "protocol": "cli",
+        "command": ["/bin/true"],
+        "env": {"LABEL": "baseline"},
+        "cases": {"mutators": [{"use": "envar", "variables": ["LABEL"], "values": ["next"]}]},
+    }));
+    document["experiment"]["max_cases"] = json!(2);
+    let path = workspace.write("experiment.yaml", &document);
+    let configuration = nadir::config::load_resolved(&path).unwrap();
+    let mut runner = WorkflowRunner::new(configuration.experiment.clone(), configuration.contracts)
+        .unwrap();
+    let mut budget = RunBudget::new(2, None, Some(Duration::ZERO));
+    let result = run_enumeration(&mut runner, &configuration.experiment, &mut budget).unwrap();
+    assert_eq!(result.stop_reason, RunStopReason::DeadlineExpired);
+    assert!(!result.phase_completed);
+    assert!(!result.capped_by_max_cases);
+    assert_eq!(result.planned_cases, 1);
+    assert_eq!(budget.cases_executed(), 1);
+    assert!(result.cases.is_empty());
+}
+
+#[test]
+fn cli_validators_reject_missing_and_empty_commands() {
+    let workspace = Workspace::new();
+    for (command, expected) in [
+        (None, "requires a non-empty 'command' list"),
+        (Some(json!([])), "requires a non-empty 'command' list"),
+        (Some(json!([""])), "requires a non-empty executable"),
+    ] {
+        let mut step = json!({"id": "app", "protocol": "cli"});
+        if let Some(command) = command {
+            step["command"] = command;
+        }
+        let document = cli_command_experiment(step);
+        let experiment = workspace.write("experiment.yaml", &document);
+        let output = stderr(call("validate", &experiment, None), 2);
+        assert!(output.contains("step 'app'") && output.contains(expected), "{output}");
+
+        let raw = serde_yaml::from_slice(&fs::read(&experiment).unwrap()).unwrap();
+        let error = nadir::experiment::resolve_experiment(raw, &Default::default(), &workspace.0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("step 'app'") && error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn cli_rejects_invalid_commands_in_steps_constructed_through_rust() {
+    use nadir::execution::runner::{RunError, WorkflowRunner};
+
+    let workspace = Workspace::new();
+    let document = cli_command_experiment(json!({
+        "id": "rust-step", "protocol": "cli", "command": ["/bin/true"],
+    }));
+    let path = workspace.write("experiment.yaml", &document);
+    for (command, expected) in [
+        (None, "requires a non-empty 'command' list"),
+        (Some(vec![]), "requires a non-empty 'command' list"),
+        (Some(vec!["".into()]), "requires a non-empty executable"),
+    ] {
+        let mut configuration = nadir::config::load_resolved(&path).unwrap();
+        Arc::make_mut(&mut configuration.experiment).steps[0].command = command;
+        let mut runner = WorkflowRunner::new(configuration.experiment, configuration.contracts)
+            .expect("the public constructor accepts the experiment");
+        let result = runner.execute_baseline();
+        assert!(matches!(
+            result,
+            Err(RunError::Infrastructure(ref message))
+                if message.contains("step 'rust-step'") && message.contains(expected)
+        ), "{result:?}");
+    }
+}
+
+#[test]
+fn cli_runs_relative_executable_in_workdir_and_preserves_empty_argument() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = Workspace::new();
+    let executable = workspace.0.join("relative-cli");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+test "$#" -eq 2 && test -z "$1" && test "$2" = marker || exit 1
+test ! -e relative-cli || exit 2
+IFS= read -r copied < fixture.txt && test "$copied" = ready
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(workspace.0.join("fixture.txt"), "ready\n").unwrap();
+    let document = cli_command_experiment(json!({
+        "id": "app",
+        "protocol": "cli",
+        "command": ["./relative-cli", "", "marker"],
+        "workdir": {"copy": ["fixture.txt"]},
+        "print": true,
+        "debug": true,
+        "oracles": [{
+            "id": "received-arguments", "use": "assert",
+            "select": "process.exit_code", "expect": {"equals": 0},
+        }],
+    }));
+    let experiment = workspace.write("experiment.yaml", &document);
+    let output = stderr(call("run", &experiment, None), 0);
+    let (printed, debug) = output.split_once("── debug: app").unwrap_or_else(|| panic!("{output}"));
+    assert!(printed.contains("./relative-cli  marker"), "{output}");
+    assert!(debug.contains("./relative-cli  marker"), "{output}");
 }
 
 #[test]
@@ -2084,6 +2613,75 @@ fn envfile_breaks_the_copied_file_one_way_per_case_and_judges_the_refusal() {
     }
     // The copied file next to the experiment is never touched.
     assert_eq!(fs::read_to_string(workspace.0.join("base.env")).unwrap(), "APP_MODE=dev\nAPP_LEVEL=info\n");
+}
+
+#[test]
+fn envfile_preserves_catalog_order_and_rejects_a_missing_saved_case_before_running() {
+    let workspace = Workspace::new();
+    let first_source = workspace.0.join("first-source.env");
+    let second_source = workspace.0.join("second-source.env");
+    fs::write(&first_source, "FIRST=base\n").unwrap();
+    fs::write(&second_source, "SECOND=base\n").unwrap();
+    let observations = workspace.0.join("observations.txt");
+    let script = r#"
+from pathlib import Path
+import sys
+
+first = Path("first.env").read_text() == "FIRST=base\n"
+second = Path("second.env").read_text() == "SECOND=base\n"
+with open(sys.argv[1], "a") as observations:
+    print(int(first), int(second), file=observations)
+"#;
+    let experiment = workspace.write("experiment.yaml", &json!({
+        "version": 1,
+        "experiment": {
+            "name": "envfile-order",
+            "max_cases": 4,
+            "protocols": {},
+            "steps": [{
+                "id": "app",
+                "protocol": "cli",
+                "command": ["/usr/bin/env", "python3", "-I", "-c", script, observations],
+                "env": {"PATH": "/usr/bin:/bin"},
+                "workdir": {"copy": [
+                    {"from": "first-source.env", "to": "first.env"},
+                    {"from": "second-source.env", "to": "second.env"}
+                ]},
+                "cases": {"mutators": [
+                    {"use": "envfile", "file": "first.env", "only": ["no_equals", "duplicate_same"]},
+                    {"use": "envfile", "file": "second.env", "only": ["duplicate_same"]}
+                ]}
+            }]
+        }
+    }));
+
+    let output = stderr(call("run", &experiment, None), 1);
+    let run_file = record_path(&output, "Run record: ");
+    let cases = run_file.parent().unwrap().join("cases");
+    let mut saved = read_json(&cases.join("0001.json"));
+    let records = [
+        saved.clone(),
+        read_json(&cases.join("0002.json")),
+        read_json(&cases.join("0003.json")),
+    ];
+    let names = records.each_ref().map(|record| {
+        assert_eq!(record["artifact_version"], 7);
+        record["regression_plan"]["envfile"]["name"].as_str().unwrap()
+    });
+    assert_eq!(names, ["duplicate_same", "no_equals", "duplicate_same"]);
+    assert_eq!(fs::read_to_string(&observations).unwrap(), "1 1\n0 1\n0 1\n0 1\n");
+
+    stderr(call("replay", &experiment, Some(&cases.join("0003.json"))), 1);
+    let ran = fs::read_to_string(&observations).unwrap();
+    assert_eq!(ran, "1 1\n0 1\n0 1\n0 1\n0 1\n");
+
+    saved["regression_plan"]["envfile"]["name"] = json!("missing");
+    let unknown = workspace.write("missing-case.json", &saved);
+    let output = stderr(call("replay", &experiment, Some(&unknown)), 2);
+    assert!(output.contains("step 'app' no longer runs envfile case 'missing'"), "{output}");
+    assert_eq!(fs::read_to_string(&observations).unwrap(), ran);
+    assert_eq!(fs::read_to_string(&first_source).unwrap(), "FIRST=base\n");
+    assert_eq!(fs::read_to_string(&second_source).unwrap(), "SECOND=base\n");
 }
 
 /// A small service for `service` steps: it validates a few variables the

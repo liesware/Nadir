@@ -38,7 +38,7 @@ pub(crate) fn request_template(
     for mutator in &step.mutators {
         match mutator {
             // The template shows the well-formed request; notes list the catalog.
-            MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } => {}
+            MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } | MutatorDecl::Body { .. } => {}
             MutatorDecl::Envar { .. } => {}
             MutatorDecl::Json { fields, mode, .. } => {
                 for field in fields.iter().flatten() {
@@ -156,7 +156,13 @@ fn notes(step: &Step) -> Vec<String> {
     for mutator in &step.mutators {
         match mutator {
             MutatorDecl::EnvFile { .. } => {}
-            MutatorDecl::Malform { malformations } => {
+            MutatorDecl::Body { alphabet, max_edits } => {
+                notes.push(format!(
+                    "body: random edits ({}, 1 to {max_edits} per case: insert, delete, replace, duplicate)",
+                    alphabet.name()
+                ));
+            }
+            MutatorDecl::Malform { malformations, sizes } => {
                 let all = crate::adapters::http_raw::Malformation::ALL.len();
                 notes.push(if malformations.len() == all {
                     format!("malform: catalog, {all} cases")
@@ -164,6 +170,12 @@ fn notes(step: &Step) -> Vec<String> {
                     let names: Vec<&str> = malformations.iter().map(|malformation| malformation.name()).collect();
                     format!("malform: catalog, {} cases: {}", names.len(), names.join(", "))
                 });
+                if *sizes != crate::adapters::http_raw::MalformSizes::default() {
+                    notes.push(format!(
+                        "malform sizes: uri {} bytes, header {} bytes, {} headers",
+                        sizes.uri, sizes.header, sizes.headers
+                    ));
+                }
             }
             MutatorDecl::Envar { variables, .. } => {
                 let names: Vec<&str> = variables.iter().map(|v| v.name.as_str()).collect();
@@ -244,6 +256,7 @@ fn notes(step: &Step) -> Vec<String> {
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .unwrap_or_default())
             }
+            ExampleAction::Json(JsonExample::Edits { edits }) => format!("{} body edits", edits.len()),
         };
         notes.push(format!("example {}: {what}, expect {}", example.id, example.expect_status));
     }

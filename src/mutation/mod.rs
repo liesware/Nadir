@@ -7,6 +7,7 @@
 //! Each variant replaces exactly one field. Bound fields and duplicate values
 //! are excluded.
 
+pub mod body;
 pub mod fuzz;
 pub mod text;
 
@@ -666,8 +667,9 @@ pub(crate) fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> 
 
         for (mutator_index, mutator) in step.mutators.iter().enumerate() {
             match mutator {
-                // Malformations are enumerated cases, not parts to mutate.
-                MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } => {}
+                // Malformations are enumerated cases, and body edits a unit of
+                // their own in the random phase: neither is a part to mutate.
+                MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } | MutatorDecl::Body { .. } => {}
                 // Variables with `mode` are random parts; fixed `value`/`values`
                 // are enumerated cases.
                 MutatorDecl::Envar { variables, .. } => {
@@ -775,7 +777,7 @@ pub fn build_token_dictionary(experiment: &Experiment) -> Vec<Vec<u8>> {
     for step in &experiment.steps {
         for mutator in &step.mutators {
             match mutator {
-                MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } => {}
+                MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } | MutatorDecl::Body { .. } => {}
                 MutatorDecl::Envar { .. } => {}
                 MutatorDecl::Http { values, .. } => {
                     for v in values {

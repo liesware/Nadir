@@ -5,7 +5,7 @@
 pub mod malform;
 pub mod transport;
 
-pub use malform::{Malformation, RawRequest};
+pub use malform::{MalformSizes, Malformation, RawRequest};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,7 +87,13 @@ impl StepProtocol for HttpRawStepProtocol {
         };
         let raw = raw_request(&request, self.client.host());
         let bytes = match input.breakage {
-            Some(super::Breakage::Request(malformation)) => malformation.apply(&raw),
+            Some(super::Breakage::Request(malformation)) => {
+                let sizes = step.mutators.iter().find_map(|mutator| match mutator {
+                    crate::experiment::types::MutatorDecl::Malform { sizes, .. } => Some(*sizes),
+                    _ => None,
+                });
+                malformation.apply_sized(&raw, &sizes.unwrap_or_default())
+            }
             _ => raw.render(),
         };
         let mut inspection = input.inspection;

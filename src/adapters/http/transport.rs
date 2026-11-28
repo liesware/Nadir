@@ -57,6 +57,9 @@ pub enum TransportReason {
     BodyReadFailed,
     NonLoopback,
     InvalidUrl,
+    /// The client could not build the request (for example a URL longer
+    /// than it accepts): nothing reached the service.
+    Unsendable,
 }
 
 impl std::fmt::Display for TransportReason {
@@ -69,6 +72,7 @@ impl std::fmt::Display for TransportReason {
             Self::BodyReadFailed => "body_read_failed",
             Self::NonLoopback => "non_loopback",
             Self::InvalidUrl => "invalid_url",
+            Self::Unsendable => "unsendable",
         })
     }
 }
@@ -100,6 +104,8 @@ pub enum TransportError {
     NonLoopback(String),
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
+    #[error("the HTTP client cannot send this request: {0}")]
+    Unsendable(String),
 }
 
 impl TransportError {
@@ -124,6 +130,7 @@ impl TransportError {
             Self::BodyRead => TransportReason::BodyReadFailed,
             Self::NonLoopback(_) => TransportReason::NonLoopback,
             Self::InvalidUrl(_) => TransportReason::InvalidUrl,
+            Self::Unsendable(_) => TransportReason::Unsendable,
         }
     }
 }
@@ -317,6 +324,10 @@ fn convert_ureq_error(error: ureq::Error) -> Result<HttpObservation, TransportEr
         }),
         ureq::Error::Timeout(_) => Err(TransportError::Timeout(phase)),
         ureq::Error::Io(error) => Err(classify_io_error(error, phase)),
+        // The request could not be built (a URI too long, an invalid header):
+        // nothing reached the service, so it is not a connection failure.
+        ureq::Error::Http(error) => Err(TransportError::Unsendable(error.to_string())),
+        ureq::Error::BadUri(error) => Err(TransportError::Unsendable(error)),
         error => Err(TransportError::ConnectionFailed(error.to_string(), phase)),
     }
 }
@@ -447,6 +458,25 @@ mod tests {
             Err(TransportError::NonLoopback(_))
         ));
         assert_eq!(client.requests_sent(), 0);
+    }
+
+    #[test]
+    fn a_request_the_client_cannot_build_is_unsendable_not_a_connection_failure() {
+        let base = Url::parse("http://127.0.0.1:19998").unwrap();
+        let client = HttpClient::new(base, Duration::from_millis(500)).unwrap();
+        let mut url = client.base_url().clone();
+        url.set_path(&"a".repeat(70_000));
+        let result = client.execute(&ResolvedStepInput {
+            url,
+            method: "GET".into(),
+            headers: Vec::new(),
+            body: None,
+            content_type: None,
+        });
+        let error = result.unwrap_err();
+        assert!(matches!(error, TransportError::Unsendable(_)), "{error:?}");
+        assert_eq!(error.reason().to_string(), "unsendable");
+        assert!(error.to_string().contains("cannot send this request"), "{error}");
     }
 
     #[test]

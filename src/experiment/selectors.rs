@@ -417,6 +417,21 @@ pub enum BindingParseResult {
     Error(ReferenceParseError),
 }
 
+impl BindingParseResult {
+    pub(crate) fn into_binding_value(
+        self,
+    ) -> Result<crate::experiment::types::BindingValue, ReferenceParseError> {
+        use crate::experiment::types::BindingValue;
+        match self {
+            Self::Literal(text) => Ok(BindingValue::Literal(Value::String(text))),
+            Self::LiteralValue(value) => Ok(BindingValue::Literal(value)),
+            Self::Reference(reference) => Ok(BindingValue::Reference(reference)),
+            Self::Composite(parts) => Ok(BindingValue::Composite(parts)),
+            Self::Error(error) => Err(error),
+        }
+    }
+}
+
 use crate::experiment::types::CompositePart;
 
 /// Parse a string containing embedded `${…}` references into a composite.

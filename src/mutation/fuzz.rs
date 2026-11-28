@@ -40,7 +40,7 @@ impl KeyRenameCase {
     pub(crate) fn expectation(&self) -> Option<(String, u16)> {
         match &self.action {
             JsonExample::Rename { key, .. } => self.expect_status.map(|status| (key.clone(), status)),
-            JsonExample::Syntax { .. } => None,
+            JsonExample::Syntax { .. } | JsonExample::Edits { .. } => None,
         }
     }
 }
@@ -71,7 +71,15 @@ pub struct FuzzCase {
     pub step_id: String,
     /// `(canonical selector, value)` pairs in descriptor order.
     pub replacements: Vec<(String, ReplacementValue)>,
+    /// A change to the whole JSON body: a key rename or `use: body` edits.
     pub key_rename: Option<KeyRenameCase>,
+}
+
+impl FuzzCase {
+    /// Whether this case breaks the body text (`use: body`).
+    pub(crate) fn edits_body(&self) -> bool {
+        self.key_rename.as_ref().is_some_and(|change| matches!(change.action, JsonExample::Edits { .. }))
+    }
 }
 
 /// How a random case is built from `(seed, iteration)`. Saved cases record
@@ -165,6 +173,14 @@ fn generate_v2(
     let keys: Vec<_> = experiment.steps.iter()
         .flat_map(|step| step.key_mutators.iter().map(move |key| (step, key)))
         .collect();
+    // `use: body`: a unit of its own, like a key rename. Without one the
+    // draws below are unchanged, so cases saved before still replay.
+    let bodies: Vec<_> = experiment.steps.iter()
+        .flat_map(|step| step.mutators.iter().filter_map(move |mutator| match mutator {
+            crate::experiment::types::MutatorDecl::Body { alphabet, max_edits } => Some((step, *alphabet, *max_edits)),
+            _ => None,
+        }))
+        .collect();
     // A part is one request location; it lists one descriptor per mutator.
     let mut parts: Vec<Vec<usize>> = Vec::new();
     for (index, descriptor) in descriptors.iter().enumerate() {
@@ -177,12 +193,23 @@ fn generate_v2(
             None => parts.push(vec![index]),
         }
     }
-    if parts.is_empty() && keys.is_empty() {
+    if parts.is_empty() && keys.is_empty() && bodies.is_empty() {
         return None;
     }
     let mut rng = Rng::for_case(seed, iteration);
-    // The first unit only decides the step (or a rename case).
-    let first = rng.below(parts.len() + keys.len());
+    // The first unit only decides the step (or a rename or body case).
+    let first = rng.below(parts.len() + keys.len() + bodies.len());
+    if let Some(index) = first.checked_sub(parts.len() + keys.len()) {
+        let (step, alphabet, max_edits) = bodies[index];
+        return Some(FuzzCase {
+            step_id: step.id.clone(),
+            replacements: Vec::new(),
+            key_rename: Some(KeyRenameCase {
+                action: JsonExample::Edits { edits: super::body::generate(&mut rng, alphabet, max_edits) },
+                expect_status: None,
+            }),
+        });
+    }
     if let Some(index) = first.checked_sub(parts.len()) {
         let (step, key) = keys[index];
         return Some(rename_case(&mut rng, step, key));
@@ -203,6 +230,8 @@ fn generate_v2(
 
     let baseline = collect_baseline_values(experiment, baseline_value, &descriptors);
     let tokens = tokens(experiment);
+    let max_path_chars = experiment.protocols.http.as_ref()
+        .map_or(crate::experiment::types::DEFAULT_MAX_PATH_CHARS, |http| http.max_path_chars);
     let step = experiment.steps.iter().find(|step| step.id == step_id)?;
     let replacements = chosen
         .into_iter()
@@ -211,10 +240,25 @@ fn generate_v2(
             let descriptor = &descriptors[index];
             let catalog = enumerate_values_for_descriptor(step, descriptor);
             let value = random_value(&mut rng, descriptor, &catalog, baseline.get(&index), &tokens);
-            (descriptor.canonical_selector.clone(), value)
+            (descriptor.canonical_selector.clone(), sendable_path(descriptor, value, max_path_chars))
         })
         .collect();
     Some(FuzzCase { step_id, replacements, key_rename: None })
+}
+
+/// A random path value cut to `max` characters (`protocols.http.max_path_chars`,
+/// 4096 by default: percent-encoded, a character takes at most 12 bytes, so
+/// the URL stays under the 65 534 bytes the HTTP client accepts). Cutting it
+/// uses no random draws: other cases are unchanged.
+fn sendable_path(descriptor: &PartDescriptor, value: ReplacementValue, max: usize) -> ReplacementValue {
+    match value {
+        ReplacementValue::JsonString(text)
+            if descriptor.input_kind == InputKind::PathField && text.chars().count() > max =>
+        {
+            ReplacementValue::JsonString(text.chars().take(max).collect())
+        }
+        other => other,
+    }
 }
 
 /// The first rule, kept to regenerate cases saved before `V2`. Do not change.
@@ -507,6 +551,28 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_path_values_are_cut_to_a_sendable_length() {
+        let descriptor = |input_kind| PartDescriptor {
+            step_id: "s".into(),
+            canonical_selector: "path.id".into(),
+            input_kind,
+            representation: crate::mutation::ValueRepresentation::JsonString,
+            mutation_mode: None,
+            mutator_index: None,
+        };
+        let long = ReplacementValue::JsonString("é".repeat(5000));
+        match sendable_path(&descriptor(InputKind::PathField), long.clone(), 4096) {
+            ReplacementValue::JsonString(text) => assert_eq!(text.chars().count(), 4096),
+            other => panic!("{other:?}"),
+        }
+        match sendable_path(&descriptor(InputKind::PathField), long.clone(), 10) {
+            ReplacementValue::JsonString(text) => assert_eq!(text, "é".repeat(10)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sendable_path(&descriptor(InputKind::HeaderField), long.clone(), 10), long);
+    }
     use crate::adapters::http::contract;
     use crate::experiment::types::ExplorationStrategy;
     use crate::{config, experiment};
@@ -688,7 +754,7 @@ experiment:
                             .iter()
                             .any(|field| selector == &field.selector()),
                         crate::experiment::types::MutatorDecl::Envar { .. } => false,
-                        crate::experiment::types::MutatorDecl::Malform { .. } | crate::experiment::types::MutatorDecl::EnvFile { .. } => false,
+                        crate::experiment::types::MutatorDecl::Malform { .. } | crate::experiment::types::MutatorDecl::EnvFile { .. } | crate::experiment::types::MutatorDecl::Body { .. } => false,
                     }),
                     "{selector} is not mutable in {}",
                     case.step_id

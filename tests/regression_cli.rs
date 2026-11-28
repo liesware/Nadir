@@ -986,14 +986,24 @@ fn cli_reports_server_errors_as_findings() {
 fn cli_replays_unconstrained_cases_and_checks_records_before_starting_the_target() {
     let directory = TestDirectory::new();
     let port = free_port();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python_api/server.py");
+    fs::write(
+        directory.0.join("launch.py"),
+        r#"import os
+import sys
+from pathlib import Path
+
+Path(__file__).with_suffix(".started").touch()
+os.execv(sys.executable, [sys.executable, "-I", *sys.argv[1:]])
+"#,
+    )
+    .unwrap();
+    let target_started = directory.0.join("launch.started");
     let source = include_str!("../examples/fuzz-probe/experiment.yaml")
         .replace("127.0.0.1:8081", &format!("127.0.0.1:{port}"))
         .replace(
-            "../../tests/fixtures/python_api/server.py",
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/python_api/server.py")
-                .display()
-                .to_string(),
+            r#""../../tests/fixtures/python_api/server.py""#,
+            &format!(r#""launch.py", {}"#, serde_json::to_string(&fixture).unwrap()),
         )
         .replace("../create-record/openapi.yaml", "openapi.yaml")
         .replace("duration_s: 5", "duration_s: 1");
@@ -1020,6 +1030,7 @@ fn cli_replays_unconstrained_cases_and_checks_records_before_starting_the_target
         0,
     );
     assert!(output.contains("Replayed case: "), "{output}");
+    fs::remove_file(&target_started).unwrap();
 
     // A record that cannot be replayed fails before any target is started.
     let mut unplayable = case.clone();
@@ -1031,7 +1042,24 @@ fn cli_replays_unconstrained_cases_and_checks_records_before_starting_the_target
         2,
     );
     assert!(output.contains("no replayable regression plan"), "{output}");
-    assert!(!output.contains("Target ready"), "{output}");
+    assert!(!target_started.exists(), "{output}");
+
+    let mut contradictory = case;
+    contradictory["regression_plan"]["fuzz"] = serde_json::json!({"seed": 12, "iteration": 2});
+    let contradictory_file = directory.0.join("contradictory.json");
+    fs::write(&contradictory_file, contradictory.to_string()).unwrap();
+    let output = stderr(
+        &cli(
+            &["replay", experiment, "--case", contradictory_file.to_str().unwrap()],
+            PASSWORD,
+        ),
+        2,
+    );
+    assert!(
+        output.contains("saved case has conflicting case kinds: variant, fuzz"),
+        "{output}"
+    );
+    assert!(!target_started.exists(), "{output}");
 }
 
 #[test]

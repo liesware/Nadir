@@ -84,6 +84,7 @@ pub(crate) fn run_random_phase(
         };
         budget.record_request();
         let key_expectation = case.key_rename.as_ref().and_then(|rename| rename.expectation());
+        let body_edits = case.edits_body();
         let mut evaluated = EvaluatedCase::new(
             experiment,
             execution,
@@ -95,6 +96,7 @@ pub(crate) fn run_random_phase(
                 generator: GeneratorVersion::CURRENT.number(),
                 max_fields,
                 key_expectation,
+                body_edits,
             },
             &runner.schema_cache,
         );

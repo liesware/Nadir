@@ -74,6 +74,88 @@ pub struct Applied {
     pub token: Option<&'static str>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DeclaredCase<'a> {
+    step_id: &'a str,
+    file: &'a str,
+    base: &'a [u8],
+    case: &'a EnvFileCase,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CaseEvidence<'a> {
+    pub step_id: &'a str,
+    pub name: &'a str,
+    pub file: &'a str,
+    pub location: Location,
+    pub token: Option<&'static str>,
+}
+
+pub(crate) struct PreparedCase<'a> {
+    declaration: DeclaredCase<'a>,
+    applied: Applied,
+}
+
+impl<'a> DeclaredCase<'a> {
+    pub(crate) fn prepare(self) -> PreparedCase<'a> {
+        PreparedCase {
+            declaration: self,
+            applied: apply(self.base, self.case),
+        }
+    }
+}
+
+impl<'a> PreparedCase<'a> {
+    pub(crate) fn evidence(&self) -> CaseEvidence<'a> {
+        CaseEvidence {
+            step_id: self.declaration.step_id,
+            name: &self.declaration.case.name,
+            file: self.declaration.file,
+            location: self.applied.location,
+            token: self.applied.token,
+        }
+    }
+
+    pub(crate) fn write_to(&self, workdir: &std::path::Path) -> std::io::Result<()> {
+        write(&workdir.join(self.declaration.file), &self.applied)
+    }
+}
+
+fn selected_cases(step: &crate::experiment::types::Step) -> impl Iterator<Item = DeclaredCase<'_>> {
+    use crate::experiment::types::MutatorDecl;
+
+    let mut first_declarations = std::collections::HashMap::new();
+    step.mutators
+        .iter()
+        .filter_map(|mutator| match mutator {
+            MutatorDecl::EnvFile { file, base, cases } => Some((file, base, cases)),
+            _ => None,
+        })
+        .flat_map(|(file, base, cases)| {
+            cases.iter().map(|case| DeclaredCase { step_id: &step.id, file, base, case })
+        })
+        .map(move |declaration| {
+            *first_declarations
+                .entry(declaration.case.name.as_str())
+                .or_insert(declaration)
+        })
+}
+
+pub(crate) fn find_case<'a>(
+    experiment: &'a crate::experiment::types::Experiment,
+    step_id: &str,
+    name: &str,
+) -> Option<DeclaredCase<'a>> {
+    let step = experiment.steps.iter().find(|step| step.id == step_id)?;
+    selected_cases(step).find(|declaration| declaration.case.name == name)
+}
+
+pub(crate) fn enumerate_cases(
+    experiment: &crate::experiment::types::Experiment,
+) -> Vec<DeclaredCase<'_>> {
+    experiment.steps.iter().flat_map(selected_cases).collect()
+}
+
 const NAMES: &[(&str, Kind)] = &[
     ("duplicate_same", Kind::DuplicateSame),
     ("duplicate_other", Kind::DuplicateOther),

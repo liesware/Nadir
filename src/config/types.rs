@@ -114,6 +114,9 @@ pub struct RawHttpProtocol {
     pub openapi: String,
     #[serde(default = "default_http_timeout_ms")]
     pub timeout_ms: u64,
+    /// Longest random path parameter value, in characters (default 4096).
+    #[serde(default)]
+    pub max_path_chars: Option<usize>,
 }
 
 /// CLI protocol configuration.
@@ -327,6 +330,28 @@ pub struct RawMutator {
     /// `use: envfile`: variables the file must not set (one case each).
     #[serde(default)]
     pub prohibited: Option<Vec<String>>,
+    /// `use: body`: how many edits a case makes at most.
+    #[serde(default)]
+    pub edits: Option<RawEdits>,
+    /// `use: malform`: sizes of `huge_uri`, `huge_header`, `many_headers`.
+    #[serde(default)]
+    pub sizes: Option<RawMalformSizes>,
+}
+
+/// `use: malform` `sizes`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawMalformSizes {
+    pub uri: Option<usize>,
+    pub header: Option<usize>,
+    pub headers: Option<usize>,
+}
+
+/// `use: body` `edits`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawEdits {
+    pub max: usize,
 }
 
 /// `use: envfile` `limits`, in bytes.
@@ -476,16 +501,18 @@ pub struct RawWhenBlock {
 pub struct RawExpectBlock {
     #[serde(default, deserialize_with = "present_value")]
     pub equals: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_value")]
     pub one_of: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_value")]
     pub exists: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_value")]
     pub absent: Option<bool>,
 }
 
-fn present_value<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error> {
-    serde_json::Value::deserialize(deserializer).map(Some)
+fn present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }

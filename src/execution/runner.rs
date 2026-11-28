@@ -387,9 +387,19 @@ impl WorkflowRunner {
         self.execute_with_scope(&[], Some(step_id), None, Some(crate::adapters::Breakage::Request(malformation)))
     }
 
-    /// Execute a case that breaks one cli step's `.env`-style file.
-    pub(crate) fn execute_envfile(&mut self, step_id: &str, case: &str) -> Result<CaseResult, RunError> {
-        self.execute_with_scope(&[], Some(step_id), None, Some(crate::adapters::Breakage::EnvFile(case.to_owned())))
+    pub(crate) fn execute_envfile<'a>(
+        &mut self,
+        declaration: crate::adapters::cli::envbreak::DeclaredCase<'a>,
+    ) -> Result<(CaseResult, crate::adapters::cli::envbreak::CaseEvidence<'a>), RunError> {
+        let prepared = declaration.prepare();
+        let evidence = prepared.evidence();
+        let result = self.execute_with_scope(
+            &[],
+            Some(evidence.step_id),
+            None,
+            Some(crate::adapters::Breakage::EnvFile(&prepared)),
+        )?;
+        Ok((result, evidence))
     }
 
     fn execute_with_scope(
@@ -397,7 +407,7 @@ impl WorkflowRunner {
         replacements: &[(String, ReplacementValue)],
         step_id: Option<&str>,
         json_example: Option<&JsonExample>,
-        breakage: Option<crate::adapters::Breakage>,
+        breakage: Option<crate::adapters::Breakage<'_>>,
     ) -> Result<CaseResult, RunError> {
         let ctx = CaseContext {
             case_id: Uuid::new_v4().to_string(),
@@ -428,7 +438,7 @@ impl WorkflowRunner {
             let selected = variant_step.is_none_or(|id| id == step.id);
             let step_replacements = if selected { replacements } else { &[] };
             let step_example = if selected { json_example } else { None };
-            let step_breakage = if selected { breakage.clone() } else { None };
+            let step_breakage = if selected { breakage } else { None };
             let inspection = match (&step.debug, self.inspector.as_deref_mut()) {
                 (Some(_), Some(inspector)) => Some(Inspection {
                     inspector,
@@ -531,7 +541,7 @@ fn inspection_secrets(hidden: &[String], step_outputs: &StepOutputs) -> Vec<Stri
 struct StepChanges<'a> {
     replacements: &'a [(String, ReplacementValue)],
     json_example: Option<&'a JsonExample>,
-    breakage: Option<crate::adapters::Breakage>,
+    breakage: Option<crate::adapters::Breakage<'a>>,
 }
 
 fn execute_step(

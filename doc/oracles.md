@@ -42,16 +42,18 @@ oracles:
     record_reference: response.body.reference
 ```
 
-Opciones de `expect` (usa solo una):
+Una regla `use: assert` requiere `select` y `expect`. Declara exactamente una de las siguientes opciones en `expect`:
 
 | Opción | Pasa si… |
 |---|---|
 | `equals: <valor>` | el valor es igual. `null` se compara literalmente, y `"${case.id}"` se sustituye. |
-| `one_of: [a, b, c]` | el valor es uno de la lista. |
+| `one_of: [a, b, c]` | el valor es uno de la lista, que debe tener al menos un elemento. |
 | `exists: true` | el campo existe (aunque sea `null`). |
 | `absent: true` | el campo no existe. |
 
 Si `select` apunta a una respuesta que no existe (timeout o conexión cortada), el veredicto es `inconclusive`: nunca pasa ni falla por falta de datos.
+
+Nadir comprueba los selectores contra el protocolo del paso observado. Los pasos HTTP y `http_raw` exponen datos de respuesta y los pasos CLI exponen datos de proceso. En una referencia a otro paso se aplica el protocolo de ese paso.
 
 ## Selectores
 

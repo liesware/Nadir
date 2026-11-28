@@ -63,7 +63,7 @@ pub(crate) fn transport_failure(
 ) -> Option<(Option<TransportReason>, Option<FailurePhase>)> {
     match outcome {
         StepOutcome::TransportError {
-            transport_reason: Some(TransportReason::InvalidUrl | TransportReason::NonLoopback),
+            transport_reason: Some(TransportReason::InvalidUrl | TransportReason::NonLoopback | TransportReason::Unsendable),
             ..
         } => None,
         StepOutcome::TransportError {

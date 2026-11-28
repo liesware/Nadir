@@ -128,7 +128,12 @@ pub(crate) fn build_step_request_with_example(
             if body.is_null() || body.as_object().is_some_and(|object| object.is_empty()) {
                 (None, None)
             } else {
-                (Some(format.encode(&body)?), Some(format.media_type().into()))
+                let mut bytes = format.encode(&body)?;
+                // `use: body`: break the serialized text; Content-Type stays.
+                if let Some(JsonExample::Edits { edits }) = json_example {
+                    bytes = crate::mutation::body::apply(&String::from_utf8_lossy(&bytes), edits).into_bytes();
+                }
+                (Some(bytes), Some(format.media_type().into()))
             }
         }
     };

@@ -11,17 +11,23 @@ pub mod envfile;
 pub mod spec;
 pub mod envbreak;
 pub mod osvalue;
+mod process_diagnostic;
 
+pub use process_diagnostic::{ProcessDiagnostic, ProcessStatusOperation};
+
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::adapters::{AdapterExecution, StepInput, StepProtocol};
 use crate::execution::runner::RunError;
+use crate::experiment::cli_command::CliCommand;
 use crate::experiment::types::{BindingValue, CliSetup, ReplacementValue, ServiceConfig, Step};
 use crate::inspect::{Control, RequestTemplate, RequestView, ResponseView};
 use crate::observation::StepObservation;
@@ -40,6 +46,23 @@ pub struct CliObservation {
     pub ready: Option<bool>,
     /// `service` steps: the exit code after Nadir stopped the ready service.
     pub stopped_code: Option<i32>,
+    pub process_diagnostic: Option<ProcessDiagnostic>,
+}
+
+impl CliObservation {
+    pub(crate) fn exit_diagnostic(&self) -> Option<&ProcessDiagnostic> {
+        if self.ready == Some(true) || self.timed_out {
+            return None;
+        }
+        self.process_diagnostic.as_ref()
+    }
+
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.timed_out || matches!(
+            self.exit_diagnostic(),
+            Some(ProcessDiagnostic::SpawnError { .. } | ProcessDiagnostic::StatusError { .. })
+        )
+    }
 }
 
 pub(crate) struct CliStepProtocol {
@@ -58,7 +81,8 @@ impl CliStepProtocol {
     /// Run `command` and wait for it (no `service`): used by the tests.
     #[cfg(test)]
     fn execute_command(&self, command: &[String], env: &HashMap<String, String>) -> (i32, String, String, bool) {
-        let observation = self.run(command, env, None, None);
+        let command = CliCommand::parse(Some(command)).unwrap();
+        let observation = self.run(command, env, Path::new(""), None, None);
         (observation.exit_code, observation.stdout, observation.stderr, observation.timed_out)
     }
 
@@ -68,23 +92,21 @@ impl CliStepProtocol {
     /// passes; a ready service is then stopped with SIGTERM (SIGKILL after 2 s).
     fn run(
         &self,
-        command: &[String],
+        command: CliCommand<'_>,
         env: &HashMap<String, String>,
+        experiment_dir: &Path,
         cwd: Option<&Path>,
         service: Option<&ServiceConfig>,
     ) -> CliObservation {
-        let failed = |stderr: String| CliObservation {
-            exit_code: -1,
-            stdout: String::new(),
-            stderr,
-            timed_out: false,
-            ready: service.map(|_| false),
-            stopped_code: None,
+        let (program, args) = command.parts();
+        let executable = Path::new(program);
+        let program = if program.contains('/') && executable.is_relative() && !experiment_dir.as_os_str().is_empty() {
+            let path = experiment_dir.join(executable);
+            Cow::Owned(std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned())
+        } else {
+            Cow::Borrowed(program)
         };
-        let Some((program, args)) = command.split_first().filter(|(program, _)| !program.is_empty()) else {
-            return failed("command list is empty".into());
-        };
-        let mut process = Command::new(program);
+        let mut process = Command::new(program.as_ref());
         // An encoded value (`osvalue`) reaches the process as its raw bytes.
         let env = env.iter().map(|(name, value)| (name, osvalue::decode(value)));
         process.args(args).env_clear().envs(env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -93,7 +115,15 @@ impl CliStepProtocol {
         }
         let mut child = match process.spawn() {
             Ok(child) => child,
-            Err(error) => return failed(format!("could not start '{program}': {error}")),
+            Err(error) => {
+                let message = format!("could not start '{program}': {error}");
+                let diagnosis = ProcessDiagnostic::SpawnError {
+                    message: message.clone(),
+                    os_error: error.raw_os_error(),
+                };
+                return Outcome::Finished(Err(diagnosis))
+                    .observe(service.is_some(), String::new(), message);
+            }
         };
         let stdout = capture(child.stdout.take());
         let stderr = capture(child.stderr.take());
@@ -117,13 +147,12 @@ impl CliStepProtocol {
         });
         let mut last_probe = Instant::now() - Duration::from_secs(1);
         let outcome = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Outcome::Exited(status.code().unwrap_or(-1)),
+            match poll_exit(&mut child) {
+                Ok(Some(status)) => break Outcome::Finished(Ok(status)),
                 Ok(None) => {}
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Outcome::Exited(-1);
+                Err(error) => {
+                    let _ = kill_and_wait(&mut child);
+                    break Outcome::Finished(Err(error));
                 }
             }
             if let Some((address, path)) = &ready_target {
@@ -135,28 +164,47 @@ impl CliStepProtocol {
                 }
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Outcome::TimedOut;
+                break Outcome::TimedOut(kill_and_wait(&mut child));
             }
             std::thread::sleep(Duration::from_millis(5));
         };
         let (stdout, stderr) = (collect(stdout), collect(stderr));
-        let (exit_code, timed_out, ready, stopped_code) = match outcome {
-            Outcome::Exited(code) => (code, false, service.map(|_| false), None),
-            Outcome::TimedOut => (-1, true, service.map(|_| false), None),
-            Outcome::Ready(code) => (code, false, Some(true), Some(code)),
-        };
-        CliObservation { exit_code, stdout, stderr, timed_out, ready, stopped_code }
+        outcome.observe(service.is_some(), stdout, stderr)
     }
 }
 
 /// How a run ended.
 enum Outcome {
-    Exited(i32),
-    TimedOut,
-    /// The service became ready and was stopped with this exit code.
-    Ready(i32),
+    Finished(Result<ExitStatus, ProcessDiagnostic>),
+    TimedOut(Result<ExitStatus, ProcessDiagnostic>),
+    Ready(Result<ExitStatus, ProcessDiagnostic>),
+}
+
+impl Outcome {
+    fn observe(self, is_service: bool, stdout: String, stderr: String) -> CliObservation {
+        let (status, timed_out, ready) = match self {
+            Self::Finished(status) => (status.map(Some), false, is_service.then_some(false)),
+            Self::TimedOut(status) => (status.map(|_| None), true, is_service.then_some(false)),
+            Self::Ready(status) => (status.map(Some), false, Some(true)),
+        };
+        let (exit_code, process_diagnostic) = match status {
+            Ok(Some(status)) => (
+                status.code().unwrap_or(-1),
+                status.signal().map(|signal| ProcessDiagnostic::Signaled { signal }),
+            ),
+            Err(error) => (-1, Some(error)),
+            Ok(None) => (-1, None),
+        };
+        CliObservation {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            ready,
+            stopped_code: (ready == Some(true)).then_some(exit_code),
+            process_diagnostic,
+        }
+    }
 }
 
 /// Read a pipe to its end (keeping at most `OUTPUT_LIMIT` bytes) on a thread.
@@ -181,18 +229,30 @@ fn capture<R: Read + Send + 'static>(reader: Option<R>) -> (Arc<Mutex<Vec<u8>>>,
     (buffer, handle)
 }
 
-/// SIGTERM, up to 2 s to exit, then SIGKILL. The exit code, or -1 for a signal.
-fn stop(child: &mut std::process::Child) -> i32 {
+fn poll_exit(child: &mut Child) -> Result<Option<ExitStatus>, ProcessDiagnostic> {
+    child.try_wait().map_err(|error| ProcessDiagnostic::status_error(ProcessStatusOperation::TryWait, error))
+}
+
+fn kill_and_wait(child: &mut Child) -> Result<ExitStatus, ProcessDiagnostic> {
+    let _ = child.kill();
+    child.wait().map_err(|error| ProcessDiagnostic::status_error(ProcessStatusOperation::Wait, error))
+}
+
+fn stop(child: &mut Child) -> Result<ExitStatus, ProcessDiagnostic> {
     let pid = nix::unistd::Pid::from_raw(child.id() as i32);
     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return status.code().unwrap_or(-1);
+        match poll_exit(child) {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = kill_and_wait(child);
+                return Err(error);
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            return child.wait().ok().and_then(|status| status.code()).unwrap_or(-1);
+            return kill_and_wait(child);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -231,6 +291,14 @@ impl Drop for Workdir {
 
 /// One line for `debug`: what the run did.
 fn summary(observation: &CliObservation) -> String {
+    if observation.ready == Some(true) {
+        return match &observation.process_diagnostic {
+            Some(ProcessDiagnostic::Signaled { signal }) => format!("ready, stopped by signal {signal}"),
+            Some(error) => format!("ready · {error}"),
+            None => format!("ready, stopped with {}", observation.stopped_code.unwrap_or(-1)),
+        };
+    }
+
     let last = observation
         .stderr
         .lines()
@@ -239,20 +307,29 @@ fn summary(observation: &CliObservation) -> String {
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
     let output = if last.is_empty() { String::new() } else { format!(" · {last}") };
-    match (observation.ready, observation.timed_out) {
-        (Some(true), _) => format!("ready, stopped with {}", observation.stopped_code.unwrap_or(-1)),
-        (Some(false), true) => format!("not ready before the timeout (killed){output}"),
-        (Some(false), false) => format!("exited {} before ready{output}", observation.exit_code),
-        (None, true) => format!("timed out (killed){output}"),
-        (None, false) => format!("exited {}{output}", observation.exit_code),
+    if observation.timed_out {
+        let timeout = if observation.ready.is_some() {
+            "not ready before the timeout (killed)"
+        } else {
+            "timed out (killed)"
+        };
+        let diagnosis = observation.process_diagnostic.as_ref()
+            .map_or_else(String::new, |diagnosis| format!(" · {diagnosis}"));
+        return format!("{timeout}{diagnosis}{output}");
     }
+    let termination = observation.process_diagnostic.as_ref()
+        .map_or_else(|| format!("exited {}", observation.exit_code), ToString::to_string);
+    let before_ready = if observation.ready.is_some() { " before ready" } else { "" };
+    if matches!(observation.process_diagnostic, Some(ProcessDiagnostic::SpawnError { .. })) {
+        return termination;
+    }
+    format!("{termination}{before_ready}{output}")
 }
 
 impl StepProtocol for CliStepProtocol {
     fn execute(&mut self, step: &Step, input: StepInput<'_>) -> Result<AdapterExecution, RunError> {
-        let command = step.command.as_deref().ok_or_else(|| {
-            RunError::Infrastructure("CLI step has no command".into())
-        })?;
+        let command = CliCommand::parse(step.command.as_deref())
+            .map_err(|error| RunError::Infrastructure(format!("step '{}': {error}", step.id)))?;
 
         let base_env: HashMap<String, String> = step.env_config.clone().unwrap_or_default();
 
@@ -285,16 +362,7 @@ impl StepProtocol for CliStepProtocol {
             }
         }
 
-        // The program resolves next to the experiment, whatever the working directory.
         let setup = step.cli.clone().unwrap_or_default();
-        let mut command = command.to_vec();
-        if let Some(program) = command.first_mut() {
-            // Absolute, because the working directory may be a temporary one.
-            if program.contains('/') && Path::new(program.as_str()).is_relative() && !setup.dir.as_os_str().is_empty() {
-                let path = setup.dir.join(program.as_str());
-                *program = std::path::absolute(&path).unwrap_or(path).to_string_lossy().into_owned();
-            }
-        }
         let workdir = match &setup.workdir_copy {
             Some(files) => match Workdir::create(&setup, files) {
                 Ok(workdir) => Some(workdir),
@@ -325,36 +393,33 @@ impl StepProtocol for CliStepProtocol {
                 }
             }
         }
-        // `use: envfile`: break the copied file the way this case says.
-        let mut broken = None;
-        if let Some(super::Breakage::EnvFile(name)) = &input.breakage {
-            let found = step.mutators.iter().find_map(|mutator| match mutator {
-                crate::experiment::types::MutatorDecl::EnvFile { file, base, cases } => {
-                    cases.iter().find(|case| &case.name == name).map(|case| (file, envbreak::apply(base, case)))
-                }
-                _ => None,
-            });
-            let (Some((file, applied)), Some(workdir)) = (found, workdir.as_ref()) else {
-                return Ok(AdapterExecution::input_error(format!("envfile case '{name}' is not declared for this step")));
+        let broken = if let Some(super::Breakage::EnvFile(prepared)) = input.breakage {
+            let evidence = prepared.evidence();
+            let Some(workdir) = workdir.as_ref() else {
+                return Ok(AdapterExecution::input_error(format!(
+                    "envfile case '{}' is not declared for this step", evidence.name
+                )));
             };
-            if let Err(error) = envbreak::write(&workdir.0.join(file), &applied) {
+            if let Err(error) = prepared.write_to(&workdir.0) {
                 return Ok(AdapterExecution::input_error(format!("envfile: {error}")));
             }
-            broken = Some((file.clone(), name.clone(), applied.location));
-        }
+            Some(evidence)
+        } else {
+            None
+        };
         let cwd = workdir.as_ref().map(|workdir| workdir.0.clone()).or_else(|| {
             (!setup.dir.as_os_str().is_empty()).then(|| setup.dir.clone())
         });
 
         let mut inspection = input.inspection;
         if let Some(inspection) = inspection.as_mut() {
-            let mut lines = vec![step.command.as_deref().unwrap_or_default().join(" ")];
-            if let Some((file, name, location)) = &broken {
-                let at = match location {
+            let mut lines = vec![command.to_string()];
+            if let Some(evidence) = broken {
+                let at = match evidence.location {
                     envbreak::Location::Line(line) => format!("line {line}"),
                     envbreak::Location::File => "the whole file".into(),
                 };
-                lines.push(format!("{file}: {name}   ({at})"));
+                lines.push(format!("{}: {}   ({at})", evidence.file, evidence.name));
             }
             for (name, _) in input.replacements {
                 let old = before_changes.get(name).map_or("(unset)".to_owned(), |value| format!("{value:?}"));
@@ -376,7 +441,7 @@ impl StepProtocol for CliStepProtocol {
             }
         }
 
-        let observation = self.run(&command, &env, cwd.as_deref(), setup.service.as_ref());
+        let observation = self.run(command, &env, &setup.dir, cwd.as_deref(), setup.service.as_ref());
         drop(workdir);
         if let Some(inspection) = inspection.as_mut() {
             inspection.inspector.after_send(step, &ResponseView::Process { summary: summary(&observation) }, &inspection.secrets);
@@ -415,7 +480,8 @@ impl StepProtocol for CliStepProtocol {
     /// shown by `debug` (`was: …`).
     fn request_template(&self, step: &Step) -> Option<RequestTemplate> {
         use crate::experiment::types::{EnvarMode, EnvarVariableRule, MutatorDecl};
-        let mut lines = vec![step.command.as_deref()?.join(" ")];
+        let command = CliCommand::parse(step.command.as_deref()).ok()?;
+        let mut lines = vec![command.to_string()];
         let mut notes = Vec::new();
         for mutator in &step.mutators {
             let MutatorDecl::Envar { variables, skipped } = mutator else {
@@ -595,7 +661,48 @@ mod tests {
         );
         assert_eq!(code, -1, "exit code");
         assert!(!timed_out, "timed_out");
-        assert!(!stderr.is_empty(), "stderr should have error: {stderr}");
+        assert!(stderr.contains("could not start 'nonexistent_command_xyz'"), "{stderr}");
+    }
+
+    #[test]
+    fn observation_errors_retain_operation_and_preserve_ready_or_timeout() {
+        let errno = nix::errno::Errno::ECHILD as i32;
+        let poll_error = ProcessDiagnostic::status_error(
+            ProcessStatusOperation::TryWait,
+            std::io::Error::from_raw_os_error(errno),
+        );
+        let wait_error = ProcessDiagnostic::status_error(
+            ProcessStatusOperation::Wait,
+            std::io::Error::other("failed to collect test-secret"),
+        );
+        let run = Outcome::Finished(Err(poll_error)).observe(true, "previous output".into(), String::new());
+        assert_eq!((run.exit_code, run.ready, run.stopped_code), (-1, Some(false), None));
+        assert!(matches!(
+            run.exit_diagnostic(),
+            Some(ProcessDiagnostic::StatusError { operation: ProcessStatusOperation::TryWait, os_error: Some(code), .. })
+                if *code == errno
+        ));
+        assert!(summary(&run).contains("could not observe process status (try_wait)"));
+        assert_eq!(run.stdout, "previous output");
+
+        let ready = Outcome::Ready(Err(wait_error.clone())).observe(true, String::new(), String::new());
+        assert_eq!((ready.exit_code, ready.ready, ready.stopped_code), (-1, Some(true), Some(-1)));
+        assert!(ready.exit_diagnostic().is_none());
+        assert!(summary(&ready).starts_with("ready · could not observe process status (wait)"));
+
+        let stopped = Outcome::Ready(Ok(ExitStatus::from_raw(nix::sys::signal::Signal::SIGTERM as i32)))
+            .observe(true, String::new(), String::new());
+        assert_eq!((stopped.exit_code, stopped.ready, stopped.stopped_code), (-1, Some(true), Some(-1)));
+        assert_eq!(summary(&stopped), "ready, stopped by signal 15");
+        assert!(stopped.exit_diagnostic().is_none());
+
+        let timeout = Outcome::TimedOut(Err(wait_error)).observe(false, String::new(), String::new());
+        assert_eq!(timeout.exit_code, -1);
+        assert!(timeout.timed_out && timeout.exit_diagnostic().is_none());
+        let response = ResponseView::Process { summary: summary(&timeout) };
+        let shown = crate::inspect::render_response(&response, &["test-secret".into()], 160);
+        assert!(shown.contains("timed out (killed)") && shown.contains("(wait)"), "{shown}");
+        assert!(shown.contains("[hidden]") && !shown.contains("test-secret"), "{shown}");
     }
 
     #[test]

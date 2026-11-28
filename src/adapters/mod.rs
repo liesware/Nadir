@@ -19,16 +19,16 @@ pub(crate) struct StepInput<'a> {
     /// Set for steps with `debug`.
     pub inspection: Option<Inspection<'a>>,
     /// Break the request (`http_raw`) or a working-directory file (`cli`).
-    pub breakage: Option<Breakage>,
+    pub breakage: Option<Breakage<'a>>,
 }
 
 /// What a broken-input case breaks in the step it targets.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Breakage {
+#[derive(Clone, Copy)]
+pub(crate) enum Breakage<'a> {
     /// `use: malform`: the HTTP request.
     Request(http_raw::Malformation),
     /// `use: envfile`: the named case of the step's `.env`-style file.
-    EnvFile(String),
+    EnvFile(&'a cli::envbreak::PreparedCase<'a>),
 }
 
 /// The `debug` hook for one request and the values to redact in it.

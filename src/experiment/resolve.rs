@@ -4,16 +4,19 @@
 //! step ordering, checks that every input selector exists in the OpenAPI
 //! contract, and computes canonical descriptor ordering.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::adapters::http::contract::{self, ResolvedContract, ResolvedOperation};
-use crate::config::{RawExperiment, RawExperimentBlock, RawStep, RawStepCases};
+use crate::config::{RawExpectBlock, RawExperiment, RawExperimentBlock, RawStep, RawStepCases};
+use crate::experiment::cli_command::CliCommand;
 use crate::experiment::selectors::{
-    self, BindingParseResult, ObservationSelector, Reference,
+    self, ObservationSelector, Reference,
 };
+use crate::experiment::step_references::{StepReferenceError, StepReferences};
 use crate::experiment::types::{
     ProtocolConfigs, CliProtocolConfig, DebugMode, EnvarMode, EnvarVariable, EnvarVariableRule,
     HttpField, MAX_DEBUG_AUTO_S, ProtocolKind, AuthConfig, Binding, BindingValue, CompositePart,
@@ -101,6 +104,12 @@ pub fn resolve_experiment(
             return Err(ResolutionError::UnsupportedConstruct {
                 step_id: step.id.clone(),
                 detail: "generated key renames require strategy: fuzz".into(),
+            });
+        }
+        if let Some(step) = steps.iter().find(|step| step.mutators.iter().any(|m| matches!(m, MutatorDecl::Body { .. }))) {
+            return Err(ResolutionError::UnsupportedConstruct {
+                step_id: step.id.clone(),
+                detail: "use: body makes random cases and requires strategy: fuzz".into(),
             });
         }
     }
@@ -254,8 +263,20 @@ fn resolve_protocols(
             base_url: http_adapter.base_url.clone(),
             openapi_path: http_adapter.openapi.clone(),
             timeout_ms: http_adapter.timeout_ms,
+            max_path_chars: http_adapter.max_path_chars.unwrap_or(crate::experiment::types::DEFAULT_MAX_PATH_CHARS),
         }
     });
+    if let Some(http) = &http {
+        if !(1..=crate::experiment::types::MAX_PATH_CHARS_LIMIT).contains(&http.max_path_chars) {
+            return Err(ResolutionError::UnsupportedConstruct {
+                step_id: String::new(),
+                detail: format!(
+                    "protocols.http.max_path_chars must be between 1 and {}",
+                    crate::experiment::types::MAX_PATH_CHARS_LIMIT
+                ),
+            });
+        }
+    }
 
     let cli = block.protocols.cli.as_ref().map(|cli_adapter| {
         CliProtocolConfig {
@@ -274,12 +295,10 @@ fn resolve_steps(
     contracts: &HashMap<String, ResolvedContract>,
     experiment_dir: &Path,
 ) -> Result<Vec<Step>, ResolutionError> {
-    // Track declared output names per step (for cross-step ref validation)
-    let mut declared_outputs: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut resolved_steps: Vec<Step> = Vec::new();
-    let step_names: HashSet<&str> = raw_steps.iter().map(|s| s.id.as_str()).collect();
+    let mut resolved_steps = Vec::new();
+    let references = StepReferences::new(raw_steps);
 
-    for raw_step in raw_steps {
+    for (position, raw_step) in raw_steps.iter().enumerate() {
         // Resolve protocol kind
         let protocol_kind = match raw_step.protocol.as_str() {
             "http" => ProtocolKind::Http,
@@ -293,7 +312,7 @@ fn resolve_steps(
         // CLI steps do not need an OpenAPI contract.
         if protocol_kind == ProtocolKind::Cli {
             resolve_cli_step(
-                raw_step, protocol_kind, &mut resolved_steps, &mut declared_outputs, &step_names, experiment_dir,
+                raw_step, protocol_kind, &mut resolved_steps, &references, position, experiment_dir,
             )?;
             continue;
         }
@@ -355,14 +374,7 @@ fn resolve_steps(
             }
         }
 
-        // Resolve bindings
-        let bindings = resolve_bindings(
-            raw_step,
-            &step_names,
-            &resolved_steps,
-            &declared_outputs,
-            operation,
-        )?;
+        let bindings = resolve_bindings(raw_step, &references, position)?;
 
         for parameter in &operation.path_params {
             if parameter.required && !bindings.iter().any(|binding| {
@@ -375,29 +387,9 @@ fn resolve_steps(
             }
         }
 
-        // Resolve auth
-        let auth = resolve_auth(
-            raw_step,
-            &step_names,
-            &resolved_steps,
-            &declared_outputs,
-        )?;
-
-        // Resolve outputs
+        let auth = resolve_auth(raw_step, &references, position)?;
         let outputs = resolve_outputs(raw_step)?;
-
-        // Track declared outputs
-        let output_names: HashSet<String> =
-            outputs.iter().map(|o| o.name.clone()).collect();
-        declared_outputs.insert(raw_step.id.clone(), output_names);
-
-        // Resolve oracles
-        let oracles = resolve_oracles(
-            raw_step,
-            &step_names,
-            &resolved_steps,
-            &declared_outputs,
-        )?;
+        let oracles = resolve_oracles(raw_step, &references, position)?;
 
         // Resolve mutators
         let (mutators, corpora) = resolve_mutators(raw_step, operation, experiment_dir)?;
@@ -477,10 +469,8 @@ fn resolve_debug(raw_step: &RawStep) -> Result<Option<DebugMode>, ResolutionErro
 
 fn resolve_bindings(
     raw_step: &RawStep,
-    step_names: &HashSet<&str>,
-    resolved_steps: &[Step],
-    declared_outputs: &HashMap<String, HashSet<String>>,
-    _operation: &ResolvedOperation,
+    references: &StepReferences<'_>,
+    position: usize,
 ) -> Result<Vec<Binding>, ResolutionError> {
     let mut bindings = Vec::new();
 
@@ -498,43 +488,15 @@ fn resolve_bindings(
             }
         })?;
 
-        // Parse the value
-        let binding_value = match selectors::parse_binding_value(value) {
-            BindingParseResult::Literal(s) => BindingValue::Literal(Value::String(s)),
-            BindingParseResult::LiteralValue(v) => BindingValue::Literal(v),
-            BindingParseResult::Reference(r) => {
-                // Validate the reference
-                validate_reference(
-                    &raw_step.id,
-                    &r,
-                    step_names,
-                    resolved_steps,
-                    declared_outputs,
-                )?;
-                BindingValue::Reference(r)
-            }
-            BindingParseResult::Composite(parts) => {
-                // Validate all references in the composite
-                for part in &parts {
-                    if let CompositePart::Reference(r) = part {
-                        validate_reference(
-                            &raw_step.id,
-                            r,
-                            step_names,
-                            resolved_steps,
-                            declared_outputs,
-                        )?;
-                    }
-                }
-                BindingValue::Composite(parts)
-            }
-            BindingParseResult::Error(e) => {
-                return Err(ResolutionError::UnsupportedConstruct {
-                    step_id: raw_step.id.clone(),
-                    detail: format!("invalid reference in binding '{}': {}", key, e),
-                });
-            }
-        };
+        let binding_value = selectors::parse_binding_value(value)
+            .into_binding_value()
+            .map_err(|error| ResolutionError::UnsupportedConstruct {
+                step_id: raw_step.id.clone(),
+                detail: format!("invalid reference in binding '{key}': {error}"),
+            })?;
+        for reference in binding_value.references() {
+            validate_reference(&raw_step.id, reference, references, position)?;
+        }
 
         bindings.push(Binding {
             selector,
@@ -549,9 +511,8 @@ fn resolve_bindings(
 
 fn resolve_auth(
     raw_step: &RawStep,
-    step_names: &HashSet<&str>,
-    resolved_steps: &[Step],
-    declared_outputs: &HashMap<String, HashSet<String>>,
+    references: &StepReferences<'_>,
+    position: usize,
 ) -> Result<Option<AuthConfig>, ResolutionError> {
     let raw_auth = match &raw_step.auth {
         Some(a) => a,
@@ -563,13 +524,7 @@ fn resolve_auth(
 
     match parsed {
         Some(Ok(r)) => {
-            validate_reference(
-                &raw_step.id,
-                &r,
-                step_names,
-                resolved_steps,
-                declared_outputs,
-            )?;
+            validate_reference(&raw_step.id, &r, references, position)?;
             Ok(Some(AuthConfig { bearer: r }))
         }
         Some(Err(e)) => Err(ResolutionError::UnsupportedConstruct {
@@ -598,14 +553,11 @@ fn resolve_outputs(
 
     let mut outputs = Vec::new();
     for (name, raw_output) in outputs_map {
-        // Parse `from` as observation selector
-        let from_raw = raw_output.from.strip_prefix("response.").unwrap_or(&raw_output.from);
-        let from = selectors::parse_observation_selector(from_raw).map_err(|e| {
-            ResolutionError::UnknownSelector {
+        let from = local_observation_selector(raw_step, &raw_output.from)
+            .map_err(|error| ResolutionError::UnsupportedConstruct {
                 step_id: raw_step.id.clone(),
-                selector: e,
-            }
-        })?;
+                detail: format!("outputs.{name}.from: {error}"),
+            })?;
 
         // Parse when_status
         let when_status = raw_output.when_status.as_ref().map(|v| match v {
@@ -630,11 +582,56 @@ fn resolve_outputs(
 
 // ── Oracles ─────────────────────────────────────────────────────────
 
+fn check_observation_protocol(
+    step: &RawStep,
+    selector: &ObservationSelector,
+    source: &str,
+) -> Result<(), String> {
+    let compatible = match selector {
+        ObservationSelector::Status | ObservationSelector::Header(_) | ObservationSelector::Body(_) => {
+            matches!(step.protocol.as_str(), "http" | "http_raw")
+        }
+        ObservationSelector::ProcessExitCode
+        | ObservationSelector::ProcessStdout
+        | ObservationSelector::ProcessStderr
+        | ObservationSelector::ProcessTimedOut
+        | ObservationSelector::ProcessReady
+        | ObservationSelector::ProcessStoppedCode => step.protocol == "cli",
+        ObservationSelector::Step { .. } => false,
+    };
+    if !compatible {
+        return Err(format!(
+            "selector '{source}' is incompatible with protocol '{}' of step '{}'",
+            step.protocol, step.id
+        ));
+    }
+    Ok(())
+}
+
+fn local_observation_selector(step: &RawStep, source: &str) -> Result<ObservationSelector, String> {
+    let selector = selectors::parse_observation_selector(
+        source.strip_prefix("response.").unwrap_or(source),
+    )?;
+    check_observation_protocol(step, &selector, source)?;
+    Ok(selector)
+}
+
+fn resolve_expect(expect: &RawExpectBlock) -> Result<ExpectCondition, String> {
+    match (&expect.equals, &expect.one_of, expect.exists, expect.absent) {
+        (Some(value), None, None, None) => Ok(ExpectCondition::Equals(value.clone())),
+        (None, Some(values), None, None) if !values.is_empty() => {
+            Ok(ExpectCondition::OneOf(values.clone()))
+        }
+        (None, None, Some(true), None) => Ok(ExpectCondition::Exists),
+        (None, None, None, Some(true)) => Ok(ExpectCondition::Absent),
+        _ => Err("requires exactly one of equals, non-empty one_of, exists: true, or absent: true".into()),
+    }
+}
+
 fn resolve_oracles(
     raw_step: &RawStep,
-    step_names: &HashSet<&str>,
-    resolved_steps: &[Step],
-    _declared_outputs: &HashMap<String, HashSet<String>>,
+    references: &StepReferences<'_>,
+    position: usize,
 ) -> Result<Vec<OracleDecl>, ResolutionError> {
     let mut oracles = Vec::new();
 
@@ -676,72 +673,56 @@ fn resolve_oracles(
             }
         };
 
-        let parse_selector = |source: &str| {
+        let invalid_field = |field: &str, error: String| ResolutionError::UnsupportedConstruct {
+            step_id: raw_step.id.clone(),
+            detail: format!("oracle '{id}' {field}: {error}"),
+        };
+        if matches!(&oracle_type, OracleType::Assert) {
+            if raw_oracle.select.is_none() {
+                return Err(invalid_field("select", "required for use: assert".into()));
+            }
+            if raw_oracle.expect.is_none() {
+                return Err(invalid_field("expect", "required for use: assert".into()));
+            }
+        } else if raw_step.protocol == "cli" {
+            return Err(invalid_field(
+                "use",
+                format!("'{}' requires an HTTP response", raw_oracle.r#use),
+            ));
+        }
+
+        let parse_selector = |field: &str, source: &str| -> Result<ObservationSelector, ResolutionError> {
             let (step_id, selector) = selectors::parse_full_observation_selector(source)
-                .map_err(|selector| ResolutionError::UnknownSelector {
-                    step_id: raw_step.id.clone(),
-                    selector,
-                })?;
+                .map_err(|error| invalid_field(field, error))?;
             if let Some(step_id) = step_id {
-                if !step_names.contains(step_id.as_str()) {
-                    return Err(ResolutionError::UnknownStepReference {
-                        step_id: raw_step.id.clone(),
-                        referenced_step: step_id,
-                    });
+                let (relation, observed_step) = references.check(position, &step_id, true)
+                    .map_err(|error| reference_error(error, &raw_step.id, &step_id))?;
+                check_observation_protocol(observed_step, &selector, source)
+                    .map_err(|error| invalid_field(field, error))?;
+                if relation == Ordering::Less {
+                    return Ok(ObservationSelector::Step { step_id, selector: Box::new(selector) });
                 }
-                if step_id == raw_step.id {
-                    return Ok(selector);
-                }
-                if !resolved_steps.iter().any(|step| step.id == step_id) {
-                    return Err(ResolutionError::ForwardReference {
-                        step_id: raw_step.id.clone(),
-                        referenced_step: step_id,
-                    });
-                }
-                return Ok(ObservationSelector::Step {
-                    step_id,
-                    selector: Box::new(selector),
-                });
+            } else {
+                check_observation_protocol(raw_step, &selector, source)
+                    .map_err(|error| invalid_field(field, error))?;
             }
             Ok(selector)
         };
 
-        let select = raw_oracle.select.as_deref().map(parse_selector).transpose()?;
+        let select = raw_oracle.select.as_deref()
+            .map(|source| parse_selector("select", source))
+            .transpose()?;
         let when_condition = raw_oracle.r#when.as_ref().map(|when| {
             Ok::<_, ResolutionError>(WhenCondition {
-                select: parse_selector(&when.select)?,
+                select: parse_selector("when.select", &when.select)?,
                 equals: when.equals.clone(),
             })
         }).transpose()?;
-
-        // Parse expect
-        let expect = raw_oracle.expect.as_ref().map(|e| {
-            if let Some(v) = &e.equals {
-                ExpectCondition::Equals(v.clone())
-            } else if let Some(v) = &e.one_of {
-                ExpectCondition::OneOf(v.clone())
-            } else if e.exists == Some(true) {
-                ExpectCondition::Exists
-            } else if e.absent == Some(true) {
-                ExpectCondition::Absent
-            } else {
-                ExpectCondition::Exists
-            }
-        });
-
-        // Parse record_reference
-        let record_reference = raw_oracle
-            .record_reference
-            .as_deref()
-            .map(|s| {
-                let stripped = s.strip_prefix("response.").unwrap_or(s);
-                selectors::parse_observation_selector(stripped).map_err(|e| {
-                    ResolutionError::UnknownSelector {
-                        step_id: raw_step.id.clone(),
-                        selector: e,
-                    }
-                })
-            })
+        let expect = raw_oracle.expect.as_ref().map(resolve_expect).transpose()
+            .map_err(|error| invalid_field("expect", error))?;
+        let record_reference = raw_oracle.record_reference.as_deref()
+            .map(|source| local_observation_selector(raw_step, source)
+                .map_err(|error| invalid_field("record_reference", error)))
             .transpose()?;
 
         oracles.push(OracleDecl {
@@ -797,6 +778,20 @@ fn resolve_mutators(
         if matches!(mutator, "file" | "file_fuzz") {
             let corpus = resolve_corpus(raw, operation, experiment_dir).map_err(invalid)?;
             corpora.push(corpus);
+            continue;
+        }
+        if mutator == "body" {
+            use crate::mutation::text::Alphabet;
+            if !operation.request_body.as_ref().is_some_and(|body| body.content_type == "application/json") {
+                return Err(invalid("use: body requires an application/json request body".into()));
+            }
+            let alphabet = match raw.mode.as_deref().unwrap_or("raw") {
+                "alpha" => Alphabet::Alpha,
+                "alphanum" => Alphabet::Alphanum,
+                "num" => Alphabet::Num,
+                _ => Alphabet::Raw,
+            };
+            result.push(MutatorDecl::Body { alphabet, max_edits: raw.edits.map_or(4, |edits| edits.max) });
             continue;
         }
         if raw.repetitions.is_some() || raw.seed.is_some() {
@@ -1010,7 +1005,24 @@ fn resolve_malform(raw: &crate::config::RawMutator) -> Result<MutatorDecl, Strin
             })
             .collect::<Result<_, _>>()?,
     };
-    Ok(MutatorDecl::Malform { malformations })
+    // Up to 16 MiB: past the limits of any server, short of exhausting memory.
+    const MAX_SIZE: usize = 16 * 1024 * 1024;
+    let mut sizes = crate::adapters::http_raw::MalformSizes::default();
+    if let Some(raw_sizes) = raw.sizes {
+        for (name, value, slot) in [
+            ("uri", raw_sizes.uri, &mut sizes.uri),
+            ("header", raw_sizes.header, &mut sizes.header),
+            ("headers", raw_sizes.headers, &mut sizes.headers),
+        ] {
+            if let Some(value) = value {
+                if value == 0 || value > MAX_SIZE {
+                    return Err(format!("malform sizes.{name} must be between 1 and {MAX_SIZE}"));
+                }
+                *slot = value;
+            }
+        }
+    }
+    Ok(MutatorDecl::Malform { malformations, sizes })
 }
 
 /// The OpenAPI schema of a header or path parameter.
@@ -1283,53 +1295,32 @@ fn resolve_examples(
 
 // ── Reference validation ────────────────────────────────────────────
 
+fn reference_error(error: StepReferenceError, step: &str, referenced: &str) -> ResolutionError {
+    let step_id = step.to_owned();
+    let referenced_step = referenced.to_owned();
+    match error {
+        StepReferenceError::Unknown => ResolutionError::UnknownStepReference { step_id, referenced_step },
+        StepReferenceError::Forward => ResolutionError::ForwardReference { step_id, referenced_step },
+    }
+}
+
 fn validate_reference(
     step_id: &str,
-    r: &Reference,
-    step_names: &HashSet<&str>,
-    resolved_steps: &[Step],
-    declared_outputs: &HashMap<String, HashSet<String>>,
+    reference: &Reference,
+    references: &StepReferences<'_>,
+    position: usize,
 ) -> Result<(), ResolutionError> {
-    match r {
-        Reference::StepOutput {
-            step_id: ref_step,
-            output_name,
-        } => {
-            // Check step exists
-            if !step_names.contains(ref_step.as_str()) {
-                return Err(ResolutionError::UnknownStepReference {
-                    step_id: step_id.into(),
-                    referenced_step: ref_step.clone(),
-                });
-            }
-
-            // Check it's not a forward reference
-            if let Some(ref_idx) =
-                resolved_steps.iter().position(|s| s.id == *ref_step)
-            {
-                let cur_idx = resolved_steps.len();
-                if ref_idx >= cur_idx {
-                    return Err(ResolutionError::ForwardReference {
-                        step_id: step_id.into(),
-                        referenced_step: ref_step.clone(),
-                    });
-                }
-            }
-
-            // Check output is declared
-            if let Some(outputs) = declared_outputs.get(ref_step.as_str()) {
-                if !outputs.contains(output_name.as_str()) {
-                    return Err(ResolutionError::MissingOutput {
-                        step_id: step_id.into(),
-                        ref_step: ref_step.clone(),
-                        output_name: output_name.clone(),
-                    });
-                }
-            }
-        }
-        Reference::Env { .. } | Reference::CaseId | Reference::TargetPort => {
-            // Runtime references — always valid at resolution time
-        }
+    let Reference::StepOutput { step_id: referenced, output_name } = reference else {
+        return Ok(());
+    };
+    references.check(position, referenced, false)
+        .map_err(|error| reference_error(error, step_id, referenced))?;
+    if !references.declares_output(referenced, output_name) {
+        return Err(ResolutionError::MissingOutput {
+            step_id: step_id.to_owned(),
+            ref_step: referenced.clone(),
+            output_name: output_name.clone(),
+        });
     }
     Ok(())
 }
@@ -1338,8 +1329,8 @@ fn resolve_cli_step(
     raw_step: &RawStep,
     protocol_kind: ProtocolKind,
     resolved_steps: &mut Vec<Step>,
-    declared_outputs: &mut HashMap<String, HashSet<String>>,
-    step_names: &HashSet<&str>,
+    references: &StepReferences<'_>,
+    position: usize,
     experiment_dir: &Path,
 ) -> Result<(), ResolutionError> {
     let invalid = |detail| ResolutionError::UnsupportedConstruct {
@@ -1347,9 +1338,7 @@ fn resolve_cli_step(
         detail,
     };
 
-    let command = raw_step.command.clone().ok_or_else(|| {
-        invalid("protocol 'cli' requires 'command'".into())
-    })?;
+    CliCommand::parse(raw_step.command.as_deref()).map_err(|error| invalid(error.to_string()))?;
     // Only the YAML `env` may hold references; `env_file` values are literal.
     let env_config = raw_step.env.clone();
     // `env` values with `${env.NAME}`, `${case.id}` or `${target.port}` become
@@ -1368,19 +1357,7 @@ fn resolve_cli_step(
             selectors::BindingParseResult::Composite(parts) => BindingValue::Composite(parts),
             _ => continue,
         };
-        let references: Vec<&Reference> = match &value {
-            BindingValue::Reference(reference) => vec![reference],
-            BindingValue::Composite(parts) => parts
-                .iter()
-                .filter_map(|part| match part {
-                    CompositePart::Reference(reference) => Some(reference),
-                    CompositePart::Literal(_) => None,
-                })
-                .collect(),
-            BindingValue::Literal(_) => Vec::new(),
-        };
-        if let Some(reference) = references
-            .iter()
+        if let Some(reference) = value.references()
             .find(|reference| matches!(reference, Reference::StepOutput { .. }))
         {
             return Err(invalid(format!(
@@ -1445,13 +1422,8 @@ fn resolve_cli_step(
         }
     };
 
-    // Resolve outputs
     let outputs = resolve_outputs(raw_step)?;
-    let output_names: HashSet<String> = outputs.iter().map(|o| o.name.clone()).collect();
-    declared_outputs.insert(raw_step.id.clone(), output_names);
-
-    // Resolve oracles
-    let oracles = resolve_oracles(raw_step, step_names, resolved_steps, declared_outputs)?;
+    let oracles = resolve_oracles(raw_step, references, position)?;
 
     // Resolve mutators
     let (mutators, corpora) = resolve_mutators_cli(raw_step, experiment_dir, &merged)?;
@@ -1473,7 +1445,7 @@ fn resolve_cli_step(
         declared_statuses: Vec::new(),
         print: raw_step.print.unwrap_or(false),
         debug: resolve_debug(raw_step)?,
-        command: Some(command),
+        command: raw_step.command.clone(),
         env_config: if env_config.is_some() || raw_step.env_file.is_some() { Some(merged) } else { None },
         cli: Some(crate::experiment::types::CliSetup {
             dir: experiment_dir.to_path_buf(),
@@ -1759,6 +1731,106 @@ mod tests {
         contracts
     }
 
+    fn create_record_config() -> RawExperiment {
+        serde_yaml::from_str(include_str!("../../examples/create-record/experiment.yaml")).unwrap()
+    }
+
+    #[test]
+    fn binding_references_validate_order_and_declared_outputs() {
+        let contracts = load_contracts();
+        for (value, raw_error, resolution_error) in [
+            ("${steps.login.outputs.token}", None, None),
+            ("prefix-${steps.login.outputs.token}-${case.id}", None, None),
+            ("prefix-${steps.missing.outputs.token}", Some("unknown step"), Some("unknown step")),
+            ("${steps.get_template.outputs.template_id}", Some("forward reference"), Some("forward reference")),
+            ("${steps.post_record.outputs.reference}", Some("forward reference"), Some("forward reference")),
+            ("${steps.login.outputs.missing}", None, Some("output 'missing' not declared")),
+            ("${steps.login.output.token}", None, Some("invalid reference in binding 'header.Accept-Language'")),
+        ] {
+            let mut raw = create_record_config();
+            raw.experiment.steps[1].bind.as_mut().unwrap()
+                .insert("header.Accept-Language".into(), Value::String(value.into()));
+
+            match raw_error {
+                Some(expected) => {
+                    let error = config::validate_raw_experiment(&raw).unwrap_err();
+                    assert!(error.contains(expected), "{value}: {error}");
+                }
+                None => config::validate_raw_experiment(&raw).unwrap(),
+            }
+            let resolved = resolve_experiment(raw, &contracts, &examples_dir());
+            match resolution_error {
+                Some(expected) => {
+                    let error = resolved.unwrap_err().to_string();
+                    assert!(error.contains(expected), "{value}: {error}");
+                }
+                None => { resolved.unwrap(); }
+            }
+        }
+    }
+
+    #[test]
+    fn bearer_cannot_reference_a_later_step() {
+        let mut raw = create_record_config();
+        raw.experiment.steps[1].auth.as_mut().unwrap().bearer =
+            "${steps.post_record.outputs.reference}".into();
+        assert!(config::validate_raw_experiment(&raw).unwrap_err().contains("forward reference"));
+        assert!(matches!(
+            resolve_experiment(raw, &load_contracts(), &examples_dir()),
+            Err(ResolutionError::ForwardReference { step_id, referenced_step })
+                if step_id == "get_template" && referenced_step == "post_record"
+        ));
+    }
+
+    #[test]
+    fn oracle_selectors_can_observe_the_current_or_an_earlier_step() {
+        let mut raw = create_record_config();
+        let oracle = &mut raw.experiment.steps[1].oracles[1];
+        oracle.select = Some("steps.get_template.response.status".into());
+        oracle.r#when = Some(config::RawWhenBlock {
+            select: "steps.login.response.status".into(),
+            equals: Value::from(200),
+        });
+        config::validate_raw_experiment(&raw).unwrap();
+        let resolved = resolve_experiment(raw, &load_contracts(), &examples_dir()).unwrap();
+        let oracle = &resolved.steps[1].oracles[1];
+        assert!(matches!(oracle.select, Some(ObservationSelector::Status)));
+        assert!(matches!(
+            oracle.when_condition.as_ref().map(|when| &when.select),
+            Some(ObservationSelector::Step { step_id, selector })
+                if step_id == "login" && matches!(selector.as_ref(), ObservationSelector::Status)
+        ));
+    }
+
+    #[test]
+    fn oracle_selectors_reject_future_and_unknown_steps() {
+        let contracts = load_contracts();
+        for step in ["missing", "post_record"] {
+            let mut raw = create_record_config();
+            raw.experiment.steps[1].oracles[1].r#when = Some(config::RawWhenBlock {
+                select: format!("steps.{step}.response.status"),
+                equals: Value::from(200),
+            });
+            let validation = config::validate_raw_experiment(&raw);
+            let error = resolve_experiment(raw, &contracts, &examples_dir()).unwrap_err();
+            if step == "missing" {
+                assert!(validation.unwrap_err().contains("references unknown step 'missing'"));
+                assert!(matches!(
+                    error,
+                    ResolutionError::UnknownStepReference { referenced_step, .. }
+                        if referenced_step == step
+                ));
+            } else {
+                validation.unwrap();
+                assert!(matches!(
+                    error,
+                    ResolutionError::ForwardReference { referenced_step, .. }
+                        if referenced_step == step
+                ));
+            }
+        }
+    }
+
     #[test]
     fn test_resolves_create_record_experiment() {
         let path = examples_dir().join("create-record/experiment.yaml");
@@ -1928,6 +2000,7 @@ mod tests {
                     base_url: "http://127.0.0.1:8080".into(),
                     openapi: "./openapi.yaml".into(),
                     timeout_ms: 2000,
+                    max_path_chars: None,
                 }),
                 cli: None,
             },
