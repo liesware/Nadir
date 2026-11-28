@@ -15,7 +15,8 @@ use crate::experiment::selectors::{
     self, BindingParseResult, ObservationSelector, Reference,
 };
 use crate::experiment::types::{
-    ProtocolConfigs, DebugMode, HttpField, MAX_DEBUG_AUTO_S, ProtocolKind, AuthConfig, Binding, BindingValue, CompositePart,
+    ProtocolConfigs, CliProtocolConfig, DebugMode, EnvarMode, EnvarVariable, EnvarVariableRule,
+    HttpField, MAX_DEBUG_AUTO_S, ProtocolKind, AuthConfig, Binding, BindingValue, CompositePart,
     CoverageConfig, CoverageTransport, ExpectCondition, ExplorationConfig,
     ExplorationStrategy, Experiment, FieldSchema, HttpProtocolConfig, JsonMutatorMode,
     MaxCases, MutatorDecl, OracleDecl, OracleKind, OracleType, OutputDecl,
@@ -119,7 +120,13 @@ pub fn resolve_experiment(
 
 /// Each `hidden` name must be read by some `${env.NAME}`, once.
 fn resolve_hidden(experiment: &Experiment) -> Result<(), ResolutionError> {
-    let used = experiment.env_references();
+    let mut used = experiment.env_references();
+    // A cli step's `env_file`/`env` names count too.
+    for step in &experiment.steps {
+        for name in step.env_config.iter().flat_map(|env| env.keys()) {
+            used.push((name.clone(), None));
+        }
+    }
     let mut seen = HashSet::new();
     for name in &experiment.hidden {
         if !seen.insert(name.as_str()) {
@@ -250,7 +257,13 @@ fn resolve_protocols(
         }
     });
 
-    Ok(ProtocolConfigs { http })
+    let cli = block.protocols.cli.as_ref().map(|cli_adapter| {
+        CliProtocolConfig {
+            timeout_ms: cli_adapter.timeout_ms,
+        }
+    });
+
+    Ok(ProtocolConfigs { http, cli })
 }
 
 // ── Steps ───────────────────────────────────────────────────────────
@@ -271,10 +284,19 @@ fn resolve_steps(
         let protocol_kind = match raw_step.protocol.as_str() {
             "http" => ProtocolKind::Http,
             "http_raw" => ProtocolKind::HttpRaw,
+            "cli" => ProtocolKind::Cli,
             other => {
                 return Err(ResolutionError::UnknownProtocol(other.into()));
             }
         };
+
+        // CLI steps do not need an OpenAPI contract.
+        if protocol_kind == ProtocolKind::Cli {
+            resolve_cli_step(
+                raw_step, protocol_kind, &mut resolved_steps, &mut declared_outputs, &step_names, experiment_dir,
+            )?;
+            continue;
+        }
 
         // Look up the contract and operation
         let contract = match protocol_kind {
@@ -282,6 +304,7 @@ fn resolve_steps(
             ProtocolKind::Http | ProtocolKind::HttpRaw => protocols.http.as_ref().and_then(|http_cfg| {
                 contracts.get(http_cfg.openapi_path.as_str())
             }),
+            ProtocolKind::Cli => None,
             #[cfg(test)]
             ProtocolKind::InMemory => None,
         };
@@ -385,19 +408,7 @@ fn resolve_steps(
         // Resolve examples
         let (examples, key_mutators) = resolve_examples(raw_step, operation, &bindings)?;
 
-        let debug = match &raw_step.debug {
-            None | Some(crate::config::RawDebug::Enabled(false)) => None,
-            Some(crate::config::RawDebug::Enabled(true)) => Some(DebugMode::Manual),
-            Some(crate::config::RawDebug::Auto(auto)) => {
-                if !(1..=MAX_DEBUG_AUTO_S).contains(&auto.auto) {
-                    return Err(ResolutionError::UnsupportedConstruct {
-                        step_id: raw_step.id.clone(),
-                        detail: format!("debug.auto must be between 1 and {MAX_DEBUG_AUTO_S} seconds"),
-                    });
-                }
-                Some(DebugMode::Auto(std::time::Duration::from_secs(u64::from(auto.auto))))
-            }
-        };
+        let debug = resolve_debug(raw_step)?;
 
         resolved_steps.push(Step {
             id: raw_step.id.clone(),
@@ -416,6 +427,9 @@ fn resolve_steps(
             declared_statuses,
             print: raw_step.print.unwrap_or(false),
             debug,
+            command: None,
+            env_config: None,
+            cli: None,
         });
     }
 
@@ -440,6 +454,23 @@ fn check_layer(raw_step: &RawStep, protocol: ProtocolKind) -> Result<(), String>
         return Err("use: malform requires protocol: http_raw".into());
     }
     Ok(())
+}
+
+/// `debug: true | false | {auto: N}` of any step.
+fn resolve_debug(raw_step: &RawStep) -> Result<Option<DebugMode>, ResolutionError> {
+    Ok(match &raw_step.debug {
+            None | Some(crate::config::RawDebug::Enabled(false)) => None,
+            Some(crate::config::RawDebug::Enabled(true)) => Some(DebugMode::Manual),
+            Some(crate::config::RawDebug::Auto(auto)) => {
+                if !(1..=MAX_DEBUG_AUTO_S).contains(&auto.auto) {
+                    return Err(ResolutionError::UnsupportedConstruct {
+                        step_id: raw_step.id.clone(),
+                        detail: format!("debug.auto must be between 1 and {MAX_DEBUG_AUTO_S} seconds"),
+                    });
+                }
+                Some(DebugMode::Auto(std::time::Duration::from_secs(u64::from(auto.auto))))
+            }
+        })
 }
 
 // ── Bindings ────────────────────────────────────────────────────────
@@ -731,11 +762,11 @@ fn resolve_oracles(
 // ── Mutators ────────────────────────────────────────────────────────
 
 const JSON_MUTATOR_MODES: &[&str] = &[
-    "edge_cases", "schema_valid", "unconstrained", "schema", "alpha", "alphanum", "alphanumeric", "raw",
+    "edge_cases", "schema_valid", "unconstrained", "schema", "alpha", "alphanum", "alphanumeric", "raw", "num",
 ];
 /// `use: http` adds `values` (only the listed values) and `absent`.
 const HTTP_MUTATOR_MODES: &[&str] = &[
-    "edge_cases", "schema_valid", "unconstrained", "schema", "alpha", "alphanum", "alphanumeric", "raw",
+    "edge_cases", "schema_valid", "unconstrained", "schema", "alpha", "alphanum", "alphanumeric", "raw", "num",
     "values", "absent",
 ];
 
@@ -768,9 +799,26 @@ fn resolve_mutators(
             corpora.push(corpus);
             continue;
         }
-        if raw.path.is_some() || raw.repetitions.is_some() || raw.seed.is_some() {
-            return Err(invalid("path, repetitions and seed are corpus options".into()));
+        if raw.repetitions.is_some() || raw.seed.is_some() {
+            return Err(invalid("repetitions and seed are corpus options".into()));
         }
+        if raw.path.is_some() && !matches!(mutator, "json" | "http") {
+            return Err(invalid(format!("path is not an option of use: {mutator}")));
+        }
+        if raw.path.is_some() && (raw.mode.is_some() || raw.length.is_some()) {
+            return Err(invalid("path takes no mode or length: each line of the file is a value".into()));
+        }
+        // `path`: one case per line, any UTF-8 (NUL included: JSON escapes it,
+        // a path segment encodes it, a header leaves out what it cannot carry).
+        let lines = match raw.path.as_deref() {
+            None => None,
+            Some("") => return Err(invalid("path must not be empty".into())),
+            Some(path) => {
+                let (lines, sha256) = crate::mutation::text::load_value_lines(&experiment_dir.join(path), true)
+                    .map_err(|error| invalid(format!("path '{path}': {error}")))?;
+                Some(crate::experiment::types::ValueLines { path: path.to_owned(), sha256, lines })
+            }
+        };
         let known_modes = match mutator {
             "json" => Some(JSON_MUTATOR_MODES),
             "http" => Some(HTTP_MUTATOR_MODES),
@@ -791,24 +839,26 @@ fn resolve_mutators(
         }
         if raw.length.is_some()
             && (!matches!(mutator, "json" | "http")
-                || !matches!(raw.mode.as_deref(), Some("alpha" | "alphanum" | "alphanumeric" | "raw")))
+                || !matches!(raw.mode.as_deref(), Some("alpha" | "alphanum" | "alphanumeric" | "raw" | "num")))
         {
             let found = match raw.mode.as_deref() {
                 Some(mode) => format!("use: {mutator}, mode: {mode}"),
                 None => format!("use: {mutator} without mode"),
             };
             return Err(invalid(format!(
-                "length requires use: json or http with mode: alpha, alphanum or raw (found {found})"
+                "length requires use: json or http with mode: alpha, alphanum, num or raw (found {found})"
             )));
         }
         let decl = match raw.r#use.as_str() {
             "json" => {
-                let mode = match raw.mode.as_deref().unwrap_or("edge_cases") {
+                let default = if lines.is_some() { "file" } else { "edge_cases" };
+                let mode = match raw.mode.as_deref().unwrap_or(default) {
+                    "file" => JsonMutatorMode::Lines,
                     "edge_cases" | "schema_valid" => JsonMutatorMode::EdgeCases,
                     "unconstrained" => JsonMutatorMode::Unconstrained,
                     "schema" => JsonMutatorMode::Schema,
                     "alphanum" | "alphanumeric" if raw.length.is_none() => JsonMutatorMode::Alphanumeric,
-                    "alpha" | "alphanum" | "alphanumeric" | "raw" => {
+                    "alpha" | "alphanum" | "alphanumeric" | "raw" | "num" => {
                         JsonMutatorMode::Text(resolve_text_generator(raw, operation).map_err(invalid)?)
                     }
                     other => {
@@ -840,9 +890,10 @@ fn resolve_mutators(
                     mode,
                     values: raw.values.clone().unwrap_or_default(),
                     field_schemas,
+                    lines,
                 }
             }
-            "http" | "headers" => resolve_http_mutator(raw, operation).map_err(invalid)?,
+            "http" | "headers" => resolve_http_mutator(raw, operation, lines).map_err(invalid)?,
             "malform" => resolve_malform(raw).map_err(invalid)?,
             _other => {
                 return Err(ResolutionError::MissingMutatorType {
@@ -860,6 +911,7 @@ fn resolve_mutators(
 fn resolve_http_mutator(
     raw: &crate::config::RawMutator,
     operation: &ResolvedOperation,
+    lines: Option<crate::experiment::types::ValueLines>,
 ) -> Result<MutatorDecl, String> {
     let legacy = raw.r#use == "headers";
     let raw_fields = raw.fields.as_deref().unwrap_or_default();
@@ -891,7 +943,13 @@ fn resolve_http_mutator(
         }
         fields.push(field);
     }
-    let mode = match raw.mode.as_deref().unwrap_or(if legacy { "values" } else { "edge_cases" }) {
+    let default = match (legacy, &lines) {
+        (true, _) => "values",
+        (false, Some(_)) => "file",
+        (false, None) => "edge_cases",
+    };
+    let mode = match raw.mode.as_deref().unwrap_or(default) {
+        "file" => JsonMutatorMode::Lines,
         "edge_cases" | "schema_valid" => JsonMutatorMode::EdgeCases,
         "unconstrained" => JsonMutatorMode::Unconstrained,
         "schema" => JsonMutatorMode::Schema,
@@ -925,7 +983,7 @@ fn resolve_http_mutator(
             other => Err(format!("{} values must be strings, found {other}", raw.r#use)),
         })
         .collect::<Result<_, _>>()?;
-    Ok(MutatorDecl::Http { fields, mode, values, field_schemas })
+    Ok(MutatorDecl::Http { fields, mode, values, field_schemas, lines })
 }
 
 /// `use: malform`: `mode: catalog` (the default) with an optional `only`.
@@ -989,7 +1047,8 @@ fn resolve_text_generator(
         // Headers cannot carry control characters.
         Some("raw") if http_field.as_ref().is_some_and(HttpField::is_header) => Alphabet::HeaderRaw,
         Some("raw") => Alphabet::Raw,
-        Some(_) => return Err("text corpus mode must be alpha, alphanum or raw".into()),
+        Some("num") => Alphabet::Num,
+        Some(_) => return Err("text corpus mode must be alpha, alphanum, num or raw".into()),
     };
     let max = raw.length.as_ref().and_then(|length| length.max).unwrap_or(256);
     let (below, above) = if let Some(reference) = raw.length.as_ref().and_then(|length| length.reference) {
@@ -1275,6 +1334,409 @@ fn validate_reference(
     Ok(())
 }
 
+fn resolve_cli_step(
+    raw_step: &RawStep,
+    protocol_kind: ProtocolKind,
+    resolved_steps: &mut Vec<Step>,
+    declared_outputs: &mut HashMap<String, HashSet<String>>,
+    step_names: &HashSet<&str>,
+    experiment_dir: &Path,
+) -> Result<(), ResolutionError> {
+    let invalid = |detail| ResolutionError::UnsupportedConstruct {
+        step_id: raw_step.id.clone(),
+        detail,
+    };
+
+    let command = raw_step.command.clone().ok_or_else(|| {
+        invalid("protocol 'cli' requires 'command'".into())
+    })?;
+    // Only the YAML `env` may hold references; `env_file` values are literal.
+    let env_config = raw_step.env.clone();
+    // `env` values with `${env.NAME}`, `${case.id}` or `${target.port}` become
+    // bindings: read from Nadir's environment once, resolved for each case,
+    // and covered by `hidden` like any other reference.
+    let mut bindings = Vec::new();
+    let mut names: Vec<&String> = env_config.iter().flatten().map(|(name, _)| name).collect();
+    names.sort();
+    for name in names {
+        let text = &env_config.as_ref().expect("names come from env")[name];
+        let value = match selectors::parse_binding_value(&Value::String(text.clone())) {
+            selectors::BindingParseResult::Error(error) => {
+                return Err(invalid(format!("env.{name}: {error}")));
+            }
+            selectors::BindingParseResult::Reference(reference) => BindingValue::Reference(reference),
+            selectors::BindingParseResult::Composite(parts) => BindingValue::Composite(parts),
+            _ => continue,
+        };
+        let references: Vec<&Reference> = match &value {
+            BindingValue::Reference(reference) => vec![reference],
+            BindingValue::Composite(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    CompositePart::Reference(reference) => Some(reference),
+                    CompositePart::Literal(_) => None,
+                })
+                .collect(),
+            BindingValue::Literal(_) => Vec::new(),
+        };
+        if let Some(reference) = references
+            .iter()
+            .find(|reference| matches!(reference, Reference::StepOutput { .. }))
+        {
+            return Err(invalid(format!(
+                "env.{name}: {reference} is not available in a cli step; use ${{env.NAME}}, ${{case.id}} or ${{target.port}}"
+            )));
+        }
+        bindings.push(Binding { selector: selectors::InputSelector::EnvVar(name.clone()), value });
+    }
+
+    let format = crate::formats::PayloadFormat::Json; // not used by CLI
+
+    // The base environment: `env_file`, then the YAML `env` on top.
+    let yaml_env = raw_step.env.clone().unwrap_or_default();
+    let mut merged: HashMap<String, String> = HashMap::new();
+    let mut from_env_file = Vec::new();
+    if let Some(file) = &raw_step.env_file {
+        for (name, value) in crate::adapters::cli::envfile::load(&experiment_dir.join(file)).map_err(&invalid)? {
+            if !yaml_env.contains_key(&name) {
+                from_env_file.push(name.clone());
+            }
+            merged.insert(name, value);
+        }
+    }
+    merged.extend(yaml_env.clone());
+    let workdir_copy = match &raw_step.workdir {
+        None => None,
+        Some(workdir) => {
+            let mut copies = Vec::new();
+            for entry in &workdir.copy {
+                let (from, to) = match entry {
+                    crate::config::RawCopy::Same(path) => (path.clone(), path.clone()),
+                    crate::config::RawCopy::Renamed { from, to } => (from.clone(), to.clone()),
+                };
+                if !experiment_dir.join(&from).is_file() {
+                    return Err(invalid(format!("workdir.copy: '{from}' is not a file next to the experiment")));
+                }
+                // The destination stays inside the temporary directory.
+                let inside = !to.is_empty()
+                    && Path::new(&to).components().all(|part| matches!(part, std::path::Component::Normal(_)));
+                if !inside {
+                    return Err(invalid(format!("workdir.copy: '{to}' must be a relative path without '..'")));
+                }
+                copies.push((from, to));
+            }
+            Some(copies)
+        }
+    };
+    let service = match &raw_step.service {
+        None => None,
+        Some(service) => {
+            let url = url::Url::parse(&service.ready.url)
+                .map_err(|error| invalid(format!("service.ready.url: {error}")))?;
+            crate::adapters::http::transport::validate_loopback(&url)
+                .map_err(|error| invalid(format!("service.ready.url: {error}")))?;
+            if service.ready.timeout_ms == 0 {
+                return Err(invalid("service.ready.timeout_ms must be at least 1".into()));
+            }
+            Some(crate::experiment::types::ServiceConfig {
+                ready_url: url,
+                ready_timeout: std::time::Duration::from_millis(service.ready.timeout_ms),
+            })
+        }
+    };
+
+    // Resolve outputs
+    let outputs = resolve_outputs(raw_step)?;
+    let output_names: HashSet<String> = outputs.iter().map(|o| o.name.clone()).collect();
+    declared_outputs.insert(raw_step.id.clone(), output_names);
+
+    // Resolve oracles
+    let oracles = resolve_oracles(raw_step, step_names, resolved_steps, declared_outputs)?;
+
+    // Resolve mutators
+    let (mutators, corpora) = resolve_mutators_cli(raw_step, experiment_dir, &merged)?;
+
+    resolved_steps.push(Step {
+        id: raw_step.id.clone(),
+        protocol: protocol_kind,
+        format,
+        operation_key: raw_step.id.clone(),
+        body_example: None,
+        bindings,
+        auth: None,
+        outputs,
+        mutators,
+        corpora,
+        key_mutators: Vec::new(),
+        oracles,
+        examples: Vec::new(),
+        declared_statuses: Vec::new(),
+        print: raw_step.print.unwrap_or(false),
+        debug: resolve_debug(raw_step)?,
+        command: Some(command),
+        env_config: if env_config.is_some() || raw_step.env_file.is_some() { Some(merged) } else { None },
+        cli: Some(crate::experiment::types::CliSetup {
+            dir: experiment_dir.to_path_buf(),
+            from_env_file,
+            env_file: raw_step.env_file.clone(),
+            workdir_copy,
+            service,
+        }),
+    });
+
+    Ok(())
+}
+
+fn resolve_mutators_cli(
+    raw_step: &RawStep,
+    experiment_dir: &Path,
+    base_env: &HashMap<String, String>,
+) -> Result<(Vec<MutatorDecl>, Vec<crate::mutation::text::Corpus>), ResolutionError> {
+    let invalid = |detail| ResolutionError::UnsupportedConstruct {
+        step_id: raw_step.id.clone(),
+        detail,
+    };
+    let Some(cases) = &raw_step.cases else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    // `variables: all` / `spec` take what the other mutators leave, so they
+    // are expanded after the explicit ones.
+    let mut mutators: Vec<Option<MutatorDecl>> = Vec::new();
+    let mut deferred = Vec::new();
+    for raw in &cases.mutators {
+        match raw.r#use.as_str() {
+            "envar" if raw.mode.as_deref() == Some("spec") => {
+                mutators.push(Some(resolve_envar_spec(raw, experiment_dir, base_env).map_err(&invalid)?));
+            }
+            "envfile" => {
+                mutators.push(Some(resolve_envfile(raw_step, raw, experiment_dir).map_err(&invalid)?));
+            }
+            "envar" if matches!(
+                raw.variables,
+                Some(crate::config::EnvarVariables::All | crate::config::EnvarVariables::Spec)
+            ) => {
+                deferred.push((mutators.len(), raw));
+                mutators.push(None);
+            }
+            "envar" => {
+                let variables = raw.variables.as_ref().ok_or_else(|| {
+                    invalid("'use: envar' requires 'variables'".into())
+                })?;
+                let resolved = resolve_envar_variables(variables, raw, experiment_dir, &[]).map_err(&invalid)?;
+                // With `env_file`, the variables are only known now.
+                if raw_step.env_file.is_some() {
+                    if let Some(missing) = resolved.iter().find(|variable| !base_env.contains_key(&variable.name)) {
+                        return Err(invalid(format!(
+                            "envar variable '{}' is not in env_file or env",
+                            missing.name
+                        )));
+                    }
+                }
+                mutators.push(Some(MutatorDecl::Envar { variables: resolved, skipped: Vec::new() }));
+            }
+            other => {
+                return Err(invalid(format!("unknown mutator 'use: {other}' for protocol 'cli'")));
+            }
+        }
+    }
+    // A variable takes one rule per step: two would collide in replay.
+    let mut claimed = HashSet::new();
+    for mutator in mutators.iter().flatten() {
+        if let MutatorDecl::Envar { variables, .. } = mutator {
+            for variable in variables {
+                if !claimed.insert(variable.name.clone()) {
+                    return Err(invalid(format!(
+                        "envar variable '{}' appears in more than one mutator of the step",
+                        variable.name
+                    )));
+                }
+            }
+        }
+    }
+    for (index, raw) in deferred {
+        let (candidates, skipped) = match raw.variables {
+            Some(crate::config::EnvarVariables::Spec) => {
+                let path = raw.spec.as_deref().ok_or_else(|| invalid("envar variables: spec requires 'spec'".into()))?;
+                let spec = load_envar_spec(path, raw.only.as_deref(), experiment_dir).map_err(&invalid)?;
+                let (used, skipped) = crate::adapters::cli::spec::applicable(&spec, base_env);
+                (used.into_iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(), skipped)
+            }
+            _ => {
+                let mut names: Vec<String> = base_env.keys().cloned().collect();
+                names.sort();
+                (names, Vec::new())
+            }
+        };
+        let names: Vec<String> = candidates.into_iter().filter(|name| !claimed.contains(name)).collect();
+        if names.is_empty() {
+            return Err(invalid("envar variables: all/spec leaves no variable (the other mutators vary them all)".into()));
+        }
+        claimed.extend(names.iter().cloned());
+        let variables = raw.variables.as_ref().expect("deferred mutators have variables");
+        let resolved = resolve_envar_variables(variables, raw, experiment_dir, &names).map_err(&invalid)?;
+        mutators[index] = Some(MutatorDecl::Envar { variables: resolved, skipped });
+    }
+    Ok((mutators.into_iter().flatten().collect(), Vec::new()))
+}
+
+/// `use: envfile`: the file comes from a `workdir.copy` entry; the catalog
+/// takes `limits`, `prohibited` and `only`.
+fn resolve_envfile(raw_step: &RawStep, raw: &crate::config::RawMutator, experiment_dir: &Path) -> Result<MutatorDecl, String> {
+    use crate::adapters::cli::envbreak;
+    let file = raw.file.clone().ok_or("use: envfile requires 'file'")?;
+    let source = raw_step
+        .workdir
+        .iter()
+        .flat_map(|workdir| &workdir.copy)
+        .find_map(|entry| match entry {
+            crate::config::RawCopy::Same(path) if *path == file => Some(path.clone()),
+            crate::config::RawCopy::Renamed { from, to } if *to == file => Some(from.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| format!("envfile '{file}' must be a destination of workdir.copy"))?;
+    let base = std::fs::read(experiment_dir.join(&source)).map_err(|error| format!("envfile source '{source}': {error}"))?;
+    if !envbreak::has_assignment(&base) {
+        return Err(format!("envfile source '{source}' has no NAME=value line to break"));
+    }
+    let limits = raw.limits.unwrap_or_default();
+    let mut cases = envbreak::catalog(
+        envbreak::Limits { file_bytes: limits.file_bytes, value_bytes: limits.value_bytes, name_bytes: limits.name_bytes },
+        raw.prohibited.as_deref().unwrap_or_default(),
+    );
+    if let Some(only) = &raw.only {
+        let known = envbreak::known_names(&cases).join(", ");
+        if let Some(unknown) = only.iter().find(|name| !cases.iter().any(|case| &case.name == *name)) {
+            return Err(format!("envfile only: unknown case '{unknown}' (cases: {known})"));
+        }
+        cases.retain(|case| only.contains(&case.name));
+    }
+    Ok(MutatorDecl::EnvFile { file, base, cases })
+}
+
+/// A specification file with `only` applied.
+fn load_envar_spec(
+    path: &str,
+    only: Option<&[String]>,
+    experiment_dir: &Path,
+) -> Result<Vec<(String, crate::adapters::cli::spec::SpecRule)>, String> {
+    let mut spec = crate::adapters::cli::spec::load(&experiment_dir.join(path))?;
+    if let Some(only) = only {
+        for name in only {
+            if !spec.iter().any(|(known, _)| known == name) {
+                return Err(format!("only: '{name}' is not in {path}"));
+            }
+        }
+        spec.retain(|(name, _)| only.contains(name));
+    }
+    Ok(spec)
+}
+
+/// `use: envar`, `mode: spec`: the specification's variables (or `only`),
+/// minus those whose `used_when` the base environment does not satisfy.
+fn resolve_envar_spec(
+    raw: &crate::config::RawMutator,
+    experiment_dir: &Path,
+    base_env: &HashMap<String, String>,
+) -> Result<MutatorDecl, String> {
+    let path = raw.spec.as_deref().ok_or("envar mode: spec requires 'spec'")?;
+    if raw.variables.is_some() {
+        return Err("envar mode: spec takes 'only', not 'variables'".into());
+    }
+    let spec = load_envar_spec(path, raw.only.as_deref(), experiment_dir)?;
+    let (used, skipped) = crate::adapters::cli::spec::applicable(&spec, base_env);
+    let variables = used
+        .into_iter()
+        .map(|(name, rule)| EnvarVariable { name: name.clone(), rule: EnvarVariableRule::Spec(rule.clone()) })
+        .collect();
+    Ok(MutatorDecl::Envar { variables, skipped })
+}
+
+/// `expanded`: the names `variables: all` / `spec` stand for.
+fn resolve_envar_variables(
+    variables: &crate::config::EnvarVariables,
+    raw: &crate::config::RawMutator,
+    experiment_dir: &Path,
+    expanded: &[String],
+) -> Result<Vec<EnvarVariable>, String> {
+    let file = |path: &str| -> Result<EnvarVariableRule, String> {
+        let (lines, sha256) = crate::mutation::text::load_value_lines(&experiment_dir.join(path), false)
+            .map_err(|error| format!("envar path '{path}': {error}"))?;
+        Ok(EnvarVariableRule::File { path: path.to_owned(), sha256, lines })
+    };
+    match variables {
+        crate::config::EnvarVariables::List(_)
+        | crate::config::EnvarVariables::All
+        | crate::config::EnvarVariables::Spec => {
+            let names = match variables {
+                crate::config::EnvarVariables::List(names) => names.as_slice(),
+                _ => expanded,
+            };
+            let rule = match (raw.mode.as_deref(), raw.path.as_deref(), &raw.values) {
+                (None, Some(path), None) => file(path)?,
+                (Some(mode), None, None) => envar_generator(mode, raw.length.as_ref())?,
+                (None, None, Some(values)) => EnvarVariableRule::Values(values.iter().map(envar_value_to_string).collect()),
+                _ => return Err("list-form envar variables require exactly one of 'mode', 'path' or 'values'".into()),
+            };
+            Ok(names.iter().map(|name| EnvarVariable { name: name.clone(), rule: rule.clone() }).collect())
+        }
+        crate::config::EnvarVariables::Map(rules) => {
+            let mut resolved = Vec::new();
+            for (name, rule) in rules {
+                let rule = match (&rule.value, &rule.values, &rule.path) {
+                    (Some(value), None, None) => EnvarVariableRule::Fixed(envar_value_to_string(value)),
+                    (None, Some(values), None) => {
+                        EnvarVariableRule::Values(values.iter().map(envar_value_to_string).collect())
+                    }
+                    (None, None, Some(path)) => file(path)?,
+                    _ => return Err(format!("envar variable '{name}' needs exactly one of 'value', 'values' or 'path'")),
+                };
+                resolved.push(EnvarVariable { name: name.clone(), rule });
+            }
+            // The map has no order of its own: keep cases stable for replay.
+            resolved.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(resolved)
+        }
+    }
+}
+
+/// A generative `envar` mode: 1 to 64 characters, or the shared length
+/// policy with `length: {reference, max}` (there is no schema to read a
+/// range from, so `reference` is required).
+fn envar_generator(mode: &str, length: Option<&crate::config::RawLength>) -> Result<EnvarVariableRule, String> {
+    use crate::mutation::text::{Alphabet, TextGenerator, MAX_TEXT_CHARS};
+    let (mode, alphabet) = match mode {
+        "alpha" => (EnvarMode::Alpha, Alphabet::Alpha),
+        "alphanum" => (EnvarMode::Alphanum, Alphabet::Alphanum),
+        "num" => (EnvarMode::Num, Alphabet::Num),
+        "raw" => (EnvarMode::Raw, Alphabet::EnvRaw),
+        "absent" | "edge_cases" | "unconstrained" if length.is_some() => {
+            return Err(format!("envar mode: {mode} takes no 'length'"));
+        }
+        "absent" => return Ok(EnvarVariableRule::Absent),
+        "edge_cases" => return Ok(EnvarVariableRule::Catalog { unconstrained: false }),
+        "unconstrained" => return Ok(EnvarVariableRule::Catalog { unconstrained: true }),
+        other => return Err(format!("unknown envar mode '{other}'")),
+    };
+    let Some(length) = length else {
+        return Ok(EnvarVariableRule::Mode(mode));
+    };
+    let reference = length.reference.ok_or("envar length requires 'reference'")?;
+    let max = length.max.unwrap_or(256);
+    if reference == 0 || reference >= max || max > MAX_TEXT_CHARS {
+        return Err(format!("envar length requires 0 < reference < max <= {MAX_TEXT_CHARS}"));
+    }
+    Ok(EnvarVariableRule::Text(TextGenerator { alphabet, below: reference, above: reference, max }))
+}
+
+/// Preserve leading zeros by treating numbers as their string representation.
+fn envar_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1376,7 +1838,7 @@ mod tests {
             max_cases: 4,
             exploration: None,
             target: None,
-            protocols: config::RawProtocols { http: None },
+            protocols: config::RawProtocols { http: None, cli: None },
             steps: vec![],
             hidden: None,
         };
@@ -1395,6 +1857,11 @@ mod tests {
             oracles: vec![],
             print: None,
             debug: None,
+            command: None,
+            env: None,
+            env_file: None,
+            workdir: None,
+            service: None,
         });
 
         let raw = RawExperiment {
@@ -1462,6 +1929,7 @@ mod tests {
                     openapi: "./openapi.yaml".into(),
                     timeout_ms: 2000,
                 }),
+                cli: None,
             },
             steps: vec![],
             hidden: None,
@@ -1484,6 +1952,11 @@ mod tests {
             oracles: vec![],
             print: None,
             debug: None,
+            command: None,
+            env: None,
+            env_file: None,
+            workdir: None,
+            service: None,
         });
 
         let raw = RawExperiment {

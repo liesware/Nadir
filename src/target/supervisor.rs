@@ -331,7 +331,7 @@ impl Drop for ManagedTarget {
 }
 
 /// Send one readiness request and report whether the status line is 2xx.
-fn probe_ready(address: SocketAddr, path: &str) -> bool {
+pub(crate) fn probe_ready(address: SocketAddr, path: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) else {
         return false;
     };

@@ -132,6 +132,46 @@ pub struct RegressionPlan {
     /// When this is a `malform` case, the step and the malformation name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub malform: Option<MalformRef>,
+    /// When this is an `envar` case, the step, variable and value it set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envar: Option<EnvarRef>,
+    /// When this is an `envfile` case, the step and the case name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envfile: Option<EnvFileRef>,
+}
+
+/// Identifies an `envfile` case; replay rebuilds the file from the copied
+/// source and the name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvFileRef {
+    pub step_id: String,
+    pub name: String,
+}
+
+/// Which value an `envar` case set: the i-th of the variable's `value`/
+/// `values`, or a named case of its `mode: spec` rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvarCase {
+    Value(usize),
+    Spec(String),
+    /// A line (1-based) of a `path` file with the file's SHA-256: replay
+    /// refuses the case once the file changes.
+    Line { line: usize, sha256: String },
+    /// The variable removed from the environment (`mode: absent`, or the
+    /// `unset` case of `mode: spec`).
+    Unset,
+    /// A named entry of the `edge_cases` or `unconstrained` catalog.
+    Catalog(String),
+}
+
+/// Identifies an `envar` case; replay rebuilds the value from the YAML and
+/// the specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvarRef {
+    pub step_id: String,
+    pub variable: String,
+    pub case: EnvarCase,
 }
 
 /// Identifies a `malform` case; replay rebuilds its bytes from the name.
@@ -271,6 +311,8 @@ impl CaseRecord {
     pub(crate) const CORPUS_VERSION: u32 = 3;
     pub(crate) const JSON_EXAMPLE_VERSION: u32 = 4;
     pub(crate) const MALFORM_VERSION: u32 = 5;
+    pub(crate) const ENVAR_VERSION: u32 = 6;
+    pub(crate) const ENVFILE_VERSION: u32 = 7;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

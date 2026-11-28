@@ -34,9 +34,10 @@ const PLAIN_WIDTH: usize = 100;
 const TEMPLATE_BODY_ROWS: usize = 10;
 
 /// Render the `print` templates as display rows.
-pub(super) fn template_rows(templates: &[RequestTemplate], width: usize) -> Vec<String> {
+/// Values listed in `hidden` show as `[hidden]`, as in `debug`.
+pub(super) fn template_rows(templates: &[RequestTemplate], width: usize, secrets: &[String]) -> Vec<String> {
     let options = RenderOptions {
-        secrets: &[],
+        secrets,
         template: true,
         width,
         max_body_rows: TEMPLATE_BODY_ROWS,

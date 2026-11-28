@@ -147,12 +147,18 @@ pub enum CoverageTransport {
 #[derive(Debug, Clone)]
 pub struct ProtocolConfigs {
     pub http: Option<HttpProtocolConfig>,
+    pub cli: Option<CliProtocolConfig>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HttpProtocolConfig {
     pub base_url: String,
     pub openapi_path: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CliProtocolConfig {
     pub timeout_ms: u64,
 }
 
@@ -180,6 +186,35 @@ pub struct Step {
     pub print: bool,
     /// Show each request before sending it.
     pub debug: Option<DebugMode>,
+    /// CLI steps: the command and its arguments.
+    pub command: Option<Vec<String>>,
+    /// CLI steps: base environment variables.
+    pub env_config: Option<HashMap<String, String>>,
+    /// CLI steps: where and how the command runs.
+    pub cli: Option<CliSetup>,
+}
+
+/// How a `protocol: cli` step runs its command.
+#[derive(Debug, Clone, Default)]
+pub struct CliSetup {
+    /// The experiment directory: the program and copied files resolve here,
+    /// and it is the working directory without `workdir`.
+    pub dir: std::path::PathBuf,
+    /// Variables that came from `env_file` (not overridden by `env`).
+    pub from_env_file: Vec<String>,
+    /// The `env_file` as written, for display.
+    pub env_file: Option<String>,
+    /// Files copied into a fresh working directory for each case, as
+    /// (source next to the experiment, destination in the directory).
+    pub workdir_copy: Option<Vec<(String, String)>>,
+    pub service: Option<ServiceConfig>,
+}
+
+/// `service.ready` of a cli step.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    pub ready_url: url::Url,
+    pub ready_timeout: std::time::Duration,
 }
 
 /// How `debug` advances to the next request.
@@ -250,6 +285,8 @@ pub enum ProtocolKind {
     Http,
     /// HTTP/1.1 written byte for byte to a socket; the step may break it.
     HttpRaw,
+    /// Execute a local command and observe its exit status and output.
+    Cli,
     #[cfg(test)]
     InMemory,
 }
@@ -343,6 +380,8 @@ pub enum MutatorDecl {
         values: Vec<Value>,
         /// Request-schema information per field, when the operation has one.
         field_schemas: HashMap<String, FieldSchema>,
+        /// `path`: one case per line (with `mode` `Lines`).
+        lines: Option<ValueLines>,
     },
     /// `use: http` (and its alias `use: headers`): header and path values.
     Http {
@@ -352,11 +391,98 @@ pub enum MutatorDecl {
         values: Vec<String>,
         /// The OpenAPI parameter schema per field selector, when declared.
         field_schemas: HashMap<String, FieldSchema>,
+        /// `path`: one case per line (with `mode` `Lines`).
+        lines: Option<ValueLines>,
+    },
+    /// `use: envfile` (`protocol: cli` only): one case per way to break the
+    /// `.env`-style `file` the working directory gets.
+    EnvFile {
+        file: String,
+        /// The file as copied, before any case breaks it.
+        base: Vec<u8>,
+        cases: Vec<crate::adapters::cli::envbreak::EnvFileCase>,
     },
     /// `use: malform` (`protocol: http_raw` only): one case per malformation.
     Malform {
         malformations: Vec<crate::adapters::http_raw::Malformation>,
     },
+    /// `use: envar` (`protocol: cli` only): vary environment variables.
+    Envar {
+        variables: Vec<EnvarVariable>,
+        /// `mode: spec` variables left out by `used_when`, with the reason.
+        skipped: Vec<String>,
+    },
+}
+
+/// A single variable rule resolved from the envar mutator.
+#[derive(Debug, Clone)]
+pub struct EnvarVariable {
+    pub name: String,
+    pub rule: EnvarVariableRule,
+}
+
+/// The kind of variation for one environment variable.
+#[derive(Debug, Clone)]
+pub enum EnvarVariableRule {
+    /// A single fixed value (enumerated).
+    Fixed(String),
+    /// Several fixed values, one case each (enumerated).
+    Values(Vec<String>),
+    /// Generative mode for `strategy: fuzz`: 1 to 64 characters.
+    Mode(EnvarMode),
+    /// Generative mode with `length`: the shared length policy.
+    Text(crate::mutation::text::TextGenerator),
+    /// `path`: one enumerated case per line of the file.
+    File {
+        path: String,
+        sha256: String,
+        lines: Vec<String>,
+    },
+    /// `mode: spec`: one enumerated case per invalid value of the rule.
+    Spec(crate::adapters::cli::spec::SpecRule),
+    /// `mode: absent`: one enumerated case without the variable.
+    Absent,
+    /// `mode: edge_cases` / `unconstrained`: one enumerated case per catalog
+    /// entry (the same catalogs as `json` and `http`, without NUL).
+    Catalog { unconstrained: bool },
+}
+
+/// The lines of a `path` file of `use: json` / `use: http`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueLines {
+    /// As written in the experiment, for display.
+    pub path: String,
+    pub sha256: String,
+    pub lines: Vec<String>,
+}
+
+impl ValueLines {
+    /// The first 8 bytes of the SHA-256: saved with each line so `replay`
+    /// refuses a case once the file changes.
+    pub fn fingerprint(&self) -> u64 {
+        u64::from_str_radix(&self.sha256[..16], 16).unwrap_or_default()
+    }
+}
+
+/// The replacement for an `envar` case value: `None` removes the variable.
+pub fn envar_replacement(value: &Option<String>) -> ReplacementValue {
+    match value {
+        Some(text) => ReplacementValue::JsonString(text.clone()),
+        None => ReplacementValue::Absent,
+    }
+}
+
+/// Generative modes for environment variable values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnvarMode {
+    /// ASCII letters only.
+    Alpha,
+    /// ASCII letters and digits.
+    Alphanum,
+    /// Digits only.
+    Num,
+    /// Any character but NUL: controls, punctuation, non-ASCII.
+    Raw,
 }
 
 /// A request part `use: http` mutates.
@@ -407,6 +533,11 @@ pub enum JsonMutatorMode {
     Absent,
     /// `use: http` only: no catalog, just the mutator's `values`.
     Values,
+    /// `path`: no catalog; one case per line of the file (then `values`).
+    Lines,
+    /// `use: envar` with `mode` and no `length`: random values of 1 to 64
+    /// characters.
+    Env(EnvarMode),
 }
 
 /// The JSON Schema of one request body field and whether its parent object
@@ -467,4 +598,12 @@ pub enum ExpectCondition {
     /// connection closed, before the timeout. Used by `wire:handled`; not
     /// available in YAML.
     Handled,
+    /// A service started with an invalid variable refused: exited before
+    /// ready with a non-zero code, naming the variable and not echoing the
+    /// value. Used by `startup:refuses`; not available in YAML.
+    Refused,
+    /// A service started without an optional variable came up with its
+    /// documented default: ready (or exit 0 without `service`). Used by
+    /// `startup:defaults`; not available in YAML.
+    StartsWithDefault,
 }

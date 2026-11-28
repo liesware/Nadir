@@ -97,7 +97,9 @@ pub(crate) fn for_case(case: &EvaluatedCase) -> impl Iterator<Item = ExecutionDi
         .filter(|_| case.process_exit.is_none())
         .filter_map(|(index, step)| {
             let (reason, phase) = transport_failure(&step.outcome)?;
-            if expected_disconnect(case, index) {
+            // `wire:handled` judged this transport outcome: a close it accepts,
+            // or a timeout it reports as its own finding (a crash record).
+            if expected_disconnect(case, index) || judged_by_wire(case, index) {
                 return None;
             }
             Some(ExecutionDiagnostic {
@@ -107,6 +109,17 @@ pub(crate) fn for_case(case: &EvaluatedCase) -> impl Iterator<Item = ExecutionDi
             })
         });
     exit.into_iter().chain(transport)
+}
+
+/// Whether `wire:handled` failed this step: its transport outcome is that
+/// rule's evidence, not a separate execution diagnostic.
+fn judged_by_wire(case: &EvaluatedCase, index: usize) -> bool {
+    case.checks.get(index).is_some_and(|checks| {
+        checks.iter().any(|check| {
+            matches!(check.oracle.expect, Some(ExpectCondition::Handled))
+                && matches!(check.evaluation.verdict, Verdict::Fail { .. })
+        })
+    })
 }
 
 pub(crate) fn expected_disconnect(case: &EvaluatedCase, index: usize) -> bool {

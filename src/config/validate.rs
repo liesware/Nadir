@@ -274,6 +274,302 @@ fn validate_steps(steps: &[RawStep]) -> Result<(), String> {
         }
     }
 
+    // Protocol-specific validation
+    for step in steps {
+        match step.protocol.as_str() {
+            "http" | "http_raw" => {
+                if step.env_file.is_some() || step.workdir.is_some() || step.service.is_some() {
+                    return Err(format!(
+                        "step '{}': env_file, workdir and service require protocol: cli",
+                        step.id
+                    ));
+                }
+            }
+            "cli" => {
+                validate_cli_step(step)?;
+            }
+            other => {
+                return Err(format!(
+                    "step '{}': unknown protocol '{}' (expected 'http', 'http_raw', or 'cli')",
+                    step.id, other
+                ));
+            }
+        }
+    }
+
+    // Envar mutator validation
+    for step in steps {
+        let Some(cases) = &step.cases else { continue };
+        for mutator in &cases.mutators {
+            if mutator.r#use == "envar" {
+                validate_envar_mutator(step, mutator)?;
+            }
+            if mutator.r#use == "envfile" {
+                validate_envfile_mutator(step, mutator)?;
+            }
+            if mutator.r#use != "envfile"
+                && (mutator.file.is_some() || mutator.limits.is_some() || mutator.prohibited.is_some())
+            {
+                return Err(format!(
+                    "step '{}': file, limits and prohibited are options of use: envfile",
+                    step.id
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_cli_step(step: &RawStep) -> Result<(), String> {
+    if step.env_file.as_deref().is_some_and(str::is_empty) {
+        return Err(format!("step '{}': env_file must not be empty", step.id));
+    }
+    if step.command.as_ref().map_or(true, |cmd| cmd.is_empty()) {
+        return Err(format!(
+            "step '{}': protocol 'cli' requires a non-empty 'command' list",
+            step.id
+        ));
+    }
+    Ok(())
+}
+
+/// `use: envfile`: a cli step, the file it breaks, and only its own options.
+fn validate_envfile_mutator(step: &RawStep, mutator: &crate::config::types::RawMutator) -> Result<(), String> {
+    if step.protocol != "cli" {
+        return Err(format!(
+            "step '{}': mutator 'use: envfile' requires protocol 'cli', found '{}'",
+            step.id, step.protocol
+        ));
+    }
+    if mutator.file.as_deref().is_none_or(str::is_empty) {
+        return Err(format!("step '{}': use: envfile requires 'file' (for example .env)", step.id));
+    }
+    if mutator.mode.as_deref().is_some_and(|mode| mode != "catalog") {
+        return Err(format!("step '{}': use: envfile takes mode: catalog only", step.id));
+    }
+    let foreign = [
+        ("fields", mutator.fields.is_some()),
+        ("values", mutator.values.is_some()),
+        ("variables", mutator.variables.is_some()),
+        ("length", mutator.length.is_some()),
+        ("path", mutator.path.is_some()),
+        ("spec", mutator.spec.is_some()),
+        ("seed", mutator.seed.is_some()),
+        ("repetitions", mutator.repetitions.is_some()),
+        ("keys", mutator.keys.is_some()),
+        ("rename_to", mutator.rename_to.is_some()),
+        ("expect_status", mutator.expect_status.is_some()),
+    ];
+    if let Some((name, _)) = foreign.iter().find(|(_, present)| *present) {
+        return Err(format!("step '{}': '{name}' does not apply to 'use: envfile'", step.id));
+    }
+    let limits = mutator.limits.unwrap_or_default();
+    if [limits.file_bytes, limits.value_bytes, limits.name_bytes].contains(&Some(0)) {
+        return Err(format!("step '{}': envfile limits must be positive", step.id));
+    }
+    if mutator.prohibited.iter().flatten().any(|name| name.is_empty() || name.contains(['=', '\n'])) {
+        return Err(format!("step '{}': envfile prohibited lists variable names", step.id));
+    }
+    Ok(())
+}
+
+/// Known generative modes for `envar`.
+const ENVAR_MODES: &[&str] = &["alpha", "alphanum", "num", "raw", "absent", "edge_cases", "unconstrained"];
+/// The `envar` modes that generate text and accept `length`.
+const ENVAR_GENERATORS: &[&str] = &["alpha", "alphanum", "num", "raw"];
+
+fn validate_envar_mutator(step: &RawStep, mutator: &crate::config::types::RawMutator) -> Result<(), String> {
+    if step.protocol != "cli" {
+        return Err(format!(
+            "step '{}': mutator 'use: envar' requires protocol 'cli', found '{}'",
+            step.id, step.protocol
+        ));
+    }
+
+    // Fields of other mutators would be silently ignored: reject them.
+    let foreign = [
+        ("fields", mutator.fields.is_some()),
+        ("repetitions", mutator.repetitions.is_some()),
+        ("seed", mutator.seed.is_some()),
+        ("keys", mutator.keys.is_some()),
+        ("rename_to", mutator.rename_to.is_some()),
+        ("expect_status", mutator.expect_status.is_some()),
+    ];
+    if let Some((name, _)) = foreign.iter().find(|(_, present)| *present) {
+        return Err(format!(
+            "step '{}': '{name}' does not apply to 'use: envar' (per-variable values go in 'variables')",
+            step.id
+        ));
+    }
+
+    // `mode: spec` lists its variables in the specification file.
+    if mutator.mode.as_deref() == Some("spec") {
+        if mutator.spec.as_deref().is_none_or(str::is_empty) {
+            return Err(format!("step '{}': envar mode: spec requires 'spec'", step.id));
+        }
+        if mutator.length.is_some() || mutator.path.is_some() {
+            return Err(format!("step '{}': envar mode: spec takes neither 'length' nor 'path'", step.id));
+        }
+        return Ok(());
+    }
+    let from_spec = matches!(mutator.variables, Some(crate::config::types::EnvarVariables::Spec));
+    match (from_spec, mutator.spec.as_deref()) {
+        (true, None | Some("")) => {
+            return Err(format!("step '{}': envar variables: spec requires 'spec'", step.id));
+        }
+        (false, Some(_)) => {
+            return Err(format!("step '{}': envar 'spec' requires mode: spec or variables: spec", step.id));
+        }
+        _ => {}
+    }
+    if mutator.only.is_some() && !from_spec {
+        return Err(format!("step '{}': envar 'only' requires mode: spec or variables: spec", step.id));
+    }
+
+    let variables = mutator.variables.as_ref().ok_or_else(|| {
+        format!(
+            "step '{}': mutator 'use: envar' requires 'variables'",
+            step.id
+        )
+    })?;
+
+    // With `env_file` the variables are only known after reading it.
+    let step_env = step.env.as_ref().filter(|_| step.env_file.is_none());
+    let mut seen_vars: HashSet<&str> = HashSet::new();
+
+    // `all` and `spec` take the list form's options; their names are known
+    // once the base environment and the specification are read.
+    let no_names = Vec::new();
+    match variables {
+        crate::config::types::EnvarVariables::List(_)
+        | crate::config::types::EnvarVariables::All
+        | crate::config::types::EnvarVariables::Spec => {
+            let names = match variables {
+                crate::config::types::EnvarVariables::List(names) => names,
+                _ => &no_names,
+            };
+            let given = [mutator.mode.is_some(), mutator.path.is_some(), mutator.values.is_some()];
+            match given.iter().filter(|present| **present).count() {
+                0 => {
+                    return Err(format!(
+                        "step '{}': 'use: envar' with list variables requires 'mode', 'path' or 'values'",
+                        step.id
+                    ));
+                }
+                1 => {}
+                _ => {
+                    return Err(format!(
+                        "step '{}': envar list variables take only one of 'mode', 'path' or 'values'",
+                        step.id
+                    ));
+                }
+            }
+            match (mutator.mode.as_deref(), mutator.path.as_deref(), &mutator.values) {
+                (Some(mode), _, _) if !ENVAR_MODES.contains(&mode) => {
+                    return Err(format!(
+                        "step '{}': unknown envar mode '{}' (expected one of: {})",
+                        step.id, mode, ENVAR_MODES.join(", ")
+                    ));
+                }
+                (_, Some(""), _) => {
+                    return Err(format!("step '{}': envar 'path' must not be empty", step.id));
+                }
+                (_, _, Some(values)) if values.is_empty() => {
+                    return Err(format!("step '{}': envar 'values' must contain at least one entry", step.id));
+                }
+                _ => {}
+            }
+            match &mutator.length {
+                Some(_) if mutator.mode.is_none() => {
+                    return Err(format!("step '{}': envar 'length' requires 'mode'", step.id));
+                }
+                Some(_) if !mutator.mode.as_deref().is_some_and(|mode| ENVAR_GENERATORS.contains(&mode)) => {
+                    return Err(format!(
+                        "step '{}': envar mode: {} takes no 'length' (only {})",
+                        step.id,
+                        mutator.mode.as_deref().unwrap_or_default(),
+                        ENVAR_GENERATORS.join(", ")
+                    ));
+                }
+                Some(length) if length.reference.is_none() => {
+                    return Err(format!(
+                        "step '{}': envar 'length' requires 'reference' (environment variables have no schema)",
+                        step.id
+                    ));
+                }
+                _ => {}
+            }
+            for name in names {
+                if !seen_vars.insert(name) {
+                    return Err(format!(
+                        "step '{}': duplicate envar variable '{}'",
+                        step.id, name
+                    ));
+                }
+                if let Some(env) = step_env {
+                    if !env.contains_key(name) {
+                        return Err(format!(
+                            "step '{}': envar variable '{}' not found in step 'env'",
+                            step.id, name
+                        ));
+                    }
+                }
+            }
+        }
+        crate::config::types::EnvarVariables::Map(rules) => {
+            if mutator.mode.is_some() || mutator.length.is_some() || mutator.path.is_some() || mutator.values.is_some() {
+                return Err(format!(
+                    "step '{}': envar map variables take 'value', 'values' or 'path' per variable, \
+                     not 'mode', 'length', 'path' or 'values' on the mutator (use the list form)",
+                    step.id
+                ));
+            }
+            for (name, rule) in rules {
+                if !seen_vars.insert(name) {
+                    return Err(format!(
+                        "step '{}': duplicate envar variable '{}'",
+                        step.id, name
+                    ));
+                }
+                if let Some(env) = step_env {
+                    if !env.contains_key(name) {
+                        return Err(format!(
+                            "step '{}': envar variable '{}' not found in step 'env'",
+                            step.id, name
+                        ));
+                    }
+                }
+                // Each rule must have exactly one of value, values or path.
+                let given = [rule.value.is_some(), rule.values.is_some(), rule.path.is_some()];
+                match given.iter().filter(|present| **present).count() {
+                    0 => {
+                        return Err(format!(
+                            "step '{}': envar variable '{}' must specify 'value', 'values' or 'path'",
+                            step.id, name
+                        ));
+                    }
+                    1 => {}
+                    _ => {
+                        return Err(format!(
+                            "step '{}': envar variable '{}' must specify only one of 'value', 'values' or 'path'",
+                            step.id, name
+                        ));
+                    }
+                }
+                match &rule.values {
+                    Some(vals) if vals.is_empty() => {
+                        return Err(format!(
+                            "step '{}': envar variable '{}' 'values' must contain at least one entry",
+                            step.id, name
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -397,7 +693,7 @@ mod tests {
                 max_fields: None,
             }),
             target: None,
-            protocols: RawProtocols { http: None },
+            protocols: RawProtocols { http: None, cli: None },
             steps: vec![],
             hidden: None,
         }
@@ -418,6 +714,11 @@ mod tests {
             oracles: vec![],
             print: None,
             debug: None,
+            command: None,
+            env: None,
+            env_file: None,
+            workdir: None,
+            service: None,
         }
     }
 
@@ -765,5 +1066,148 @@ mod tests {
     fn test_accepts_both_examples() {
         // This test is in config/mod.rs as it uses the `load` function
         // which reads actual files.
+    }
+
+    #[test]
+    fn test_cli_step_requires_command() {
+        let mut block = minimal_block();
+        block.protocols.cli = Some(RawCliProtocol { timeout_ms: 5000 });
+        block.steps = vec![RawStep {
+            id: "cli-step".into(),
+            protocol: "cli".into(),
+            command: None,
+            env: None,
+            ..make_missing_step_defaults("cli")
+        }];
+        let raw = RawExperiment { version: 1, experiment: block };
+        let err = validate_raw_experiment(&raw).unwrap_err();
+        assert!(err.contains("requires a non-empty 'command'"), "{err}");
+    }
+
+    #[test]
+    fn test_envar_rejects_on_http_step() {
+        let mut block = minimal_block();
+        block.protocols.http = Some(RawHttpProtocol {
+            base_url: "http://127.0.0.1:8080".into(),
+            openapi: "openapi.yaml".into(),
+            timeout_ms: 2000,
+        });
+        let mut step = make_step("http-step");
+        step.cases = Some(RawStepCases {
+            mutators: vec![RawMutator {
+                r#use: "envar".into(),
+                variables: Some(EnvarVariables::List(vec!["X".into()])),
+                mode: Some("alphanum".into()),
+                ..RawMutator::default()
+            }],
+            examples: vec![],
+        });
+        block.steps = vec![step];
+        let raw = RawExperiment { version: 1, experiment: block };
+        let err = validate_raw_experiment(&raw).unwrap_err();
+        assert!(err.contains("envar"), "{err}");
+        assert!(err.contains("protocol 'cli'"), "{err}");
+    }
+
+    #[test]
+    fn test_envar_rejects_duplicate_variable() {
+        let mut block = minimal_block();
+        block.protocols.cli = Some(RawCliProtocol { timeout_ms: 5000 });
+        let mut step = RawStep {
+            id: "cli-step".into(),
+            protocol: "cli".into(),
+            command: Some(vec!["echo".into(), "hi".into()]),
+            env: Some([("X".into(), "base".into())].into_iter().collect()),
+            ..make_missing_step_defaults("cli")
+        };
+        step.cases = Some(RawStepCases {
+            mutators: vec![RawMutator {
+                r#use: "envar".into(),
+                variables: Some(EnvarVariables::List(vec!["X".into(), "X".into()])),
+                mode: Some("alphanum".into()),
+                ..RawMutator::default()
+            }],
+            examples: vec![],
+        });
+        block.steps = vec![step];
+        let raw = RawExperiment { version: 1, experiment: block };
+        let err = validate_raw_experiment(&raw).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn test_envar_rejects_variable_not_in_env() {
+        let mut block = minimal_block();
+        block.protocols.cli = Some(RawCliProtocol { timeout_ms: 5000 });
+        let mut step = RawStep {
+            id: "cli-step".into(),
+            protocol: "cli".into(),
+            command: Some(vec!["echo".into(), "hi".into()]),
+            env: Some([("X".into(), "base".into())].into_iter().collect()),
+            ..make_missing_step_defaults("cli")
+        };
+        step.cases = Some(RawStepCases {
+            mutators: vec![RawMutator {
+                r#use: "envar".into(),
+                variables: Some(EnvarVariables::List(vec!["Y".into()])),
+                mode: Some("alphanum".into()),
+                ..RawMutator::default()
+            }],
+            examples: vec![],
+        });
+        block.steps = vec![step];
+        let raw = RawExperiment { version: 1, experiment: block };
+        let err = validate_raw_experiment(&raw).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn test_envar_rejects_unknown_mode() {
+        let mut block = minimal_block();
+        block.protocols.cli = Some(RawCliProtocol { timeout_ms: 5000 });
+        let mut step = RawStep {
+            id: "cli-step".into(),
+            protocol: "cli".into(),
+            command: Some(vec!["echo".into(), "hi".into()]),
+            env: Some([("X".into(), "base".into())].into_iter().collect()),
+            ..make_missing_step_defaults("cli")
+        };
+        step.cases = Some(RawStepCases {
+            mutators: vec![RawMutator {
+                r#use: "envar".into(),
+                variables: Some(EnvarVariables::List(vec!["X".into()])),
+                mode: Some("unknown".into()),
+                ..RawMutator::default()
+            }],
+            examples: vec![],
+        });
+        block.steps = vec![step];
+        let raw = RawExperiment { version: 1, experiment: block };
+        let err = validate_raw_experiment(&raw).unwrap_err();
+        assert!(err.contains("unknown envar mode"), "{err}");
+    }
+
+    /// Helper: produce a step with fields that make the CLI validator happy
+    fn make_missing_step_defaults(protocol: &str) -> RawStep {
+        RawStep {
+            id: "tmp".into(),
+            protocol: protocol.into(),
+            format: None,
+            operation_id: None,
+            operation_path: None,
+            body_example: None,
+            bind: None,
+            auth: None,
+            outputs: None,
+            cases: None,
+            oracles: vec![],
+            print: None,
+            debug: None,
+            command: None,
+            env: None,
+            env_file: None,
+            workdir: None,
+            service: None,
+        }
     }
 }

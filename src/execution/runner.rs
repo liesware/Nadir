@@ -169,13 +169,29 @@ impl WorkflowRunner {
         if experiment.target.as_ref().is_some_and(|target| target.coverage.is_some()) {
             return Err(PrepareError::CoverageUnavailable);
         }
-        let http = HttpStepProtocol::prepare(&experiment, contracts.clone())?;
-        let target_port = http.target_port();
-        let raw = crate::adapters::http_raw::HttpRawStepProtocol::prepare(&experiment, contracts)?;
-        let protocols = HashMap::from([
-            (ProtocolKind::Http, Box::new(http) as Box<dyn StepProtocol>),
-            (ProtocolKind::HttpRaw, Box::new(raw) as Box<dyn StepProtocol>),
-        ]);
+        // HTTP adapters need `protocols.http`; an experiment of cli steps has none.
+        let mut protocols: HashMap<ProtocolKind, Box<dyn StepProtocol>> = HashMap::new();
+        let mut target_port = None;
+        let uses_http = experiment
+            .steps
+            .iter()
+            .any(|step| matches!(step.protocol, ProtocolKind::Http | ProtocolKind::HttpRaw));
+        if experiment.protocols.http.is_some() || uses_http {
+            let http = HttpStepProtocol::prepare(&experiment, contracts.clone())?;
+            target_port = http.target_port();
+            let raw = crate::adapters::http_raw::HttpRawStepProtocol::prepare(&experiment, contracts)?;
+            protocols.insert(ProtocolKind::Http, Box::new(http));
+            protocols.insert(ProtocolKind::HttpRaw, Box::new(raw));
+        }
+        // `protocols.cli` is optional: its timeout defaults to 5000 ms.
+        if experiment.protocols.cli.is_some()
+            || experiment.steps.iter().any(|step| step.protocol == ProtocolKind::Cli)
+        {
+            let cli = crate::adapters::cli::CliStepProtocol::prepare(
+                experiment.protocols.cli.as_ref().map_or(5000, |c| c.timeout_ms),
+            );
+            protocols.insert(ProtocolKind::Cli, Box::new(cli));
+        }
         Self::with_protocols(experiment, protocols, target_port, schema_cache)
     }
 
@@ -202,7 +218,14 @@ impl WorkflowRunner {
         let references = experiment.env_references();
         let (mut hidden_values, mut short_hidden) = (Vec::new(), Vec::new());
         for name in &experiment.hidden {
-            let value = runtime.environment.get(name).cloned().or_else(|| {
+            // A cli step's own value (from `env_file` or a literal `env`).
+            let cli_value = experiment
+                .steps
+                .iter()
+                .filter_map(|step| step.env_config.as_ref()?.get(name))
+                .find(|value| !value.contains("${"))
+                .cloned();
+            let value = runtime.environment.get(name).cloned().or(cli_value).or_else(|| {
                 let set = environment
                     .get(std::ffi::OsStr::new(name))
                     .and_then(|value| value.to_str())
@@ -284,7 +307,7 @@ impl WorkflowRunner {
         self.experiment
             .steps
             .iter()
-            .filter(|step| self.protocols.contains_key(&step.protocol))
+            .filter(|step| matches!(step.protocol, ProtocolKind::Http | ProtocolKind::HttpRaw))
             .map(|step| step.operation_key.as_str())
             .collect::<std::collections::HashSet<_>>()
             .len()
@@ -361,7 +384,12 @@ impl WorkflowRunner {
         step_id: &str,
         malformation: crate::adapters::http_raw::Malformation,
     ) -> Result<CaseResult, RunError> {
-        self.execute_with_scope(&[], Some(step_id), None, Some(malformation))
+        self.execute_with_scope(&[], Some(step_id), None, Some(crate::adapters::Breakage::Request(malformation)))
+    }
+
+    /// Execute a case that breaks one cli step's `.env`-style file.
+    pub(crate) fn execute_envfile(&mut self, step_id: &str, case: &str) -> Result<CaseResult, RunError> {
+        self.execute_with_scope(&[], Some(step_id), None, Some(crate::adapters::Breakage::EnvFile(case.to_owned())))
     }
 
     fn execute_with_scope(
@@ -369,7 +397,7 @@ impl WorkflowRunner {
         replacements: &[(String, ReplacementValue)],
         step_id: Option<&str>,
         json_example: Option<&JsonExample>,
-        malformation: Option<crate::adapters::http_raw::Malformation>,
+        breakage: Option<crate::adapters::Breakage>,
     ) -> Result<CaseResult, RunError> {
         let ctx = CaseContext {
             case_id: Uuid::new_v4().to_string(),
@@ -400,7 +428,7 @@ impl WorkflowRunner {
             let selected = variant_step.is_none_or(|id| id == step.id);
             let step_replacements = if selected { replacements } else { &[] };
             let step_example = if selected { json_example } else { None };
-            let step_malformation = if selected { malformation } else { None };
+            let step_breakage = if selected { breakage.clone() } else { None };
             let inspection = match (&step.debug, self.inspector.as_deref_mut()) {
                 (Some(_), Some(inspector)) => Some(Inspection {
                     inspector,
@@ -411,7 +439,7 @@ impl WorkflowRunner {
             let changes = StepChanges {
                 replacements: step_replacements,
                 json_example: step_example,
-                malformation: step_malformation,
+                breakage: step_breakage,
             };
             let execution = execute_step(step, adapter.as_mut(), &ctx, changes, &step_outputs, inspection)?;
             requests_sent = requests_sent.wrapping_add(execution.requests_sent);
@@ -503,7 +531,7 @@ fn inspection_secrets(hidden: &[String], step_outputs: &StepOutputs) -> Vec<Stri
 struct StepChanges<'a> {
     replacements: &'a [(String, ReplacementValue)],
     json_example: Option<&'a JsonExample>,
-    malformation: Option<crate::adapters::http_raw::Malformation>,
+    breakage: Option<crate::adapters::Breakage>,
 }
 
 fn execute_step(
@@ -531,7 +559,7 @@ fn execute_step(
         replacements: changes.replacements,
         json_example: changes.json_example,
         inspection,
-        malformation: changes.malformation,
+        breakage: changes.breakage,
     })
 }
 
@@ -813,6 +841,9 @@ mod tests {
             oracles: Vec::new(),
             examples: Vec::new(),
             declared_statuses: Vec::new(),
+            command: None,
+            env_config: None,
+            cli: None,
         };
         let sink = Step {
             id: "sink".into(),
@@ -845,6 +876,7 @@ mod tests {
                 mode: JsonMutatorMode::Alphanumeric,
                 values: vec![json!("original"), json!("changed")],
                 field_schemas: HashMap::new(),
+                lines: None,
             }],
             ..source.clone()
         };
@@ -853,7 +885,7 @@ mod tests {
             max_cases: MaxCases::new(2),
             exploration: ExplorationConfig { strategy: ExplorationStrategy::Enumerate },
             target: None,
-            protocols: ProtocolConfigs { http: None },
+            protocols: ProtocolConfigs { http: None, cli: None },
             steps: vec![source, sink],
             hidden: Vec::new(),
         });

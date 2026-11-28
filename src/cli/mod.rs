@@ -105,9 +105,9 @@ fn cmd_run(path: &Path) -> Result<Exit, String> {
         let mut display = progress.borrow_mut();
         if display.interactive() {
             let width = display.size().0;
-            display.set_print(debugger::template_rows(&templates, width));
+            display.set_print(debugger::template_rows(&templates, width, runner.hidden_values()));
         } else {
-            eprintln!("{}", debugger::template_rows(&templates, 100).join("\n"));
+            eprintln!("{}", debugger::template_rows(&templates, 100, runner.hidden_values()).join("\n"));
         }
     }
     // Keys are read (raw mode) only while `debug` has something to show.
@@ -170,6 +170,38 @@ fn cmd_run(path: &Path) -> Result<Exit, String> {
 }
 
 fn crash_label(record: &crate::artifacts::CaseRecord) -> String {
+    // `startup:refuses · serve · VECTIS_MODE=other_word · started (ready)`.
+    let envar = record.regression_plan.as_ref().and_then(|plan| plan.envar.as_ref());
+    if let Some(crate::artifacts::EnvarRef { step_id, variable, case }) = envar {
+        let change = match case {
+            crate::artifacts::EnvarCase::Spec(name) => Some(format!("{variable}={name}")),
+            crate::artifacts::EnvarCase::Unset => Some(format!("{variable} unset")),
+            _ => None,
+        };
+        let rules = [crate::evaluation::case::STARTUP_REFUSES_RULE, crate::evaluation::case::STARTUP_DEFAULTS_RULE];
+        let failed = record
+            .step_results
+            .iter()
+            .flat_map(|step| &step.oracle_verdicts)
+            .find(|check| rules.contains(&check.oracle_id.as_str()) && check.verdict == "fail");
+        if let (Some(change), Some(check)) = (change, failed) {
+            let observed = check.observed.as_deref().unwrap_or_default().trim_matches('"');
+            return format!("{} · {step_id} · {change} · {observed}", check.oracle_id);
+        }
+    }
+    // `envfile:refuses · serve · .env:unknown_name · exited 0`.
+    if let Some(envfile) = record.regression_plan.as_ref().and_then(|plan| plan.envfile.as_ref()) {
+        let observed = record
+            .step_results
+            .iter()
+            .flat_map(|step| &step.oracle_verdicts)
+            .find(|check| check.oracle_id == crate::evaluation::case::ENVFILE_REFUSES_RULE && check.verdict == "fail")
+            .and_then(|check| check.observed.as_deref())
+            .map(|observed| observed.trim_matches('"').to_owned());
+        if let Some(observed) = observed {
+            return format!("envfile:refuses · {} · {} · {observed}", envfile.step_id, envfile.name);
+        }
+    }
     let malform = record.regression_plan.as_ref().and_then(|plan| plan.malform.as_ref());
     if let Some(malform) = malform {
         let observed = record

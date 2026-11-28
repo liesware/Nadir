@@ -87,6 +87,14 @@ enum PendingCase {
         step_id: String,
         malformation: crate::adapters::http_raw::Malformation,
     },
+    Envar {
+        reference: crate::artifacts::EnvarRef,
+        value: Option<String>,
+    },
+    EnvFile {
+        step_id: String,
+        name: String,
+    },
     Baseline,
 }
 
@@ -105,6 +113,8 @@ pub(crate) fn prepare_replay(
         version,
         1 | CaseRecord::CURRENT_VERSION | CaseRecord::CORPUS_VERSION | CaseRecord::JSON_EXAMPLE_VERSION
             | CaseRecord::MALFORM_VERSION
+            | CaseRecord::ENVAR_VERSION
+            | CaseRecord::ENVFILE_VERSION
     ) {
         return Err(ReplayError::InputError(format!(
             "unsupported case record version {version}"
@@ -113,6 +123,12 @@ pub(crate) fn prepare_replay(
     let plan = record.regression_plan.ok_or_else(|| {
         ReplayError::InputError("record has no replayable regression plan".into())
     })?;
+    if (version == CaseRecord::ENVAR_VERSION) != plan.envar.is_some() {
+        return Err(ReplayError::InputError("invalid envar case record version".into()));
+    }
+    if (version == CaseRecord::ENVFILE_VERSION) != plan.envfile.is_some() {
+        return Err(ReplayError::InputError("invalid envfile case record version".into()));
+    }
     if (version == CaseRecord::MALFORM_VERSION) != plan.malform.is_some() {
         return Err(ReplayError::InputError("invalid malform case record version".into()));
     }
@@ -132,7 +148,9 @@ pub(crate) fn prepare_replay(
     let contract = if version == 1 {
         ReplayContract::Legacy
     } else {
-        if plan.openapi_fingerprints.is_empty() {
+        // An experiment without OpenAPI (only cli steps) records no
+        // fingerprints; one that declares OpenAPI always records them.
+        if plan.openapi_fingerprints.is_empty() && !fingerprints.is_empty() {
             return Err(ReplayError::InputError(
                 "version 2 record has no OpenAPI fingerprints".into(),
             ));
@@ -162,6 +180,42 @@ pub(crate) fn prepare_replay(
         ));
     }
     let pending = match (plan.variant, &plan.example_id) {
+        // An envar case is rebuilt from the YAML and the specification.
+        (None, None) if plan.envar.is_some() => {
+            let reference = plan.envar.expect("checked above");
+            let value = crate::exploration::enumerate::envar_enumerated_cases(runner.experiment())
+                .into_iter()
+                .find(|(step, variable, case, _)| {
+                    *step == reference.step_id && *variable == reference.variable && *case == reference.case
+                })
+                .map(|(_, _, _, value)| value)
+                .ok_or_else(|| ReplayError::InputError(match &reference.case {
+                    crate::artifacts::EnvarCase::Line { line, .. } => format!(
+                        "the file of {} in step '{}' changed since line {line} was saved",
+                        reference.variable, reference.step_id
+                    ),
+                    _ => format!("step '{}' no longer sets {} that way", reference.step_id, reference.variable),
+                }))?;
+            PendingCase::Envar { reference, value }
+        }
+        // An envfile case is rebuilt from the copied file and its name.
+        (None, None) if plan.envfile.is_some() => {
+            let reference = plan.envfile.expect("checked above");
+            let declared = runner.experiment().steps.iter()
+                .filter(|step| step.id == reference.step_id)
+                .flat_map(|step| &step.mutators)
+                .any(|mutator| matches!(
+                    mutator,
+                    crate::experiment::types::MutatorDecl::EnvFile { cases, .. } if cases.iter().any(|case| case.name == reference.name)
+                ));
+            if !declared {
+                return Err(ReplayError::InputError(format!(
+                    "step '{}' no longer runs envfile case '{}'",
+                    reference.step_id, reference.name
+                )));
+            }
+            PendingCase::EnvFile { step_id: reference.step_id, name: reference.name }
+        }
         // A malform case is rebuilt from its name; the step must still run it.
         (None, None) if plan.malform.is_some() => {
             let reference = plan.malform.expect("checked above");
@@ -230,9 +284,13 @@ pub(crate) fn prepare_replay(
             let value = variant
                 .resolve(runner.experiment(), version)
                 .ok_or_else(|| {
-                    ReplayError::InputError(
-                        "saved variant is incompatible with the experiment".into(),
-                    )
+                    ReplayError::InputError(match variant.saved_line() {
+                        Some(line) => format!(
+                            "the file of {} in step '{}' changed since line {line} was saved",
+                            variant.selector, variant.step_id
+                        ),
+                        None => "saved variant is incompatible with the experiment".into(),
+                    })
                 })?;
             if matches!(contract, ReplayContract::Changed(_))
                 && !selector_in_contract(&variant, &value, runner)
@@ -327,6 +385,24 @@ pub(crate) fn execute_replay(
             let selector = format!("body.{}", reference.field);
             let execution = runner.execute_variant(&reference.step_id, &selector, value)?;
             (execution, ExecutedPlan::Corpus(reference))
+        }
+        PendingCase::Envar { reference, value } => {
+            let execution = runner.execute_variant(
+                &reference.step_id,
+                &reference.variable,
+                crate::experiment::types::envar_replacement(&value),
+            )?;
+            let plan = ExecutedPlan::Envar {
+                step_id: reference.step_id,
+                variable: reference.variable,
+                case: reference.case,
+                value,
+            };
+            (execution, plan)
+        }
+        PendingCase::EnvFile { step_id, name } => {
+            let execution = runner.execute_envfile(&step_id, &name)?;
+            (execution, ExecutedPlan::EnvFile { step_id, name })
         }
         PendingCase::Malform { step_id, malformation } => {
             let execution = runner.execute_malform(&step_id, malformation)?;

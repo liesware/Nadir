@@ -49,9 +49,21 @@ pub fn load(path: &Path) -> Result<RawExperiment, ConfigError> {
 }
 
 pub(crate) fn parse(contents: &str) -> Result<RawExperiment, ConfigError> {
-    let raw: RawExperiment = serde_yaml::from_str(contents)?;
+    let mut raw: RawExperiment = serde_yaml::from_str(contents)?;
+    normalize_aliases(&mut raw);
     validate_raw_experiment(&raw).map_err(ConfigError::Validation)?;
     Ok(raw)
+}
+
+/// Older names that still load: `use: envvar` is `use: envar`.
+fn normalize_aliases(raw: &mut RawExperiment) {
+    for step in &mut raw.experiment.steps {
+        for mutator in step.cases.iter_mut().flat_map(|cases| cases.mutators.iter_mut()) {
+            if mutator.r#use == "envvar" {
+                mutator.r#use = "envar".into();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +73,28 @@ mod tests {
 
     fn examples_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+    }
+
+    #[test]
+    fn envvar_still_loads_as_envar() {
+        let yaml = r#"
+version: 1
+experiment:
+  name: alias
+  max_cases: 3
+  protocols: {}
+  steps:
+    - id: run
+      protocol: cli
+      command: ["/bin/true"]
+      env: {A: "1"}
+      cases:
+        mutators:
+          - use: envvar
+            variables: {A: {value: "2"}}
+"#;
+        let raw = parse(yaml).unwrap();
+        assert_eq!(raw.experiment.steps[0].cases.as_ref().unwrap().mutators[0].r#use, "envar");
     }
 
     #[test]

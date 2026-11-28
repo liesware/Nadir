@@ -45,6 +45,10 @@ pub enum ViolationCategory {
     ServerError,
     /// The service neither answered nor closed the connection in time.
     Unresponsive,
+    /// A service started although a variable broke its specification.
+    AcceptedInvalidConfig,
+    /// The process died from a panic or a signal.
+    Crash,
 }
 
 // ── Oracle context ─────────────────────────────────────────────────

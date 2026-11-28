@@ -1,5 +1,6 @@
 //! Protocol adapters: `http` (application layer) and `http_raw` (the HTTP
 //! layer, byte for byte).
+pub mod cli;
 pub mod http;
 pub mod http_raw;
 
@@ -17,8 +18,17 @@ pub(crate) struct StepInput<'a> {
     pub json_example: Option<&'a JsonExample>,
     /// Set for steps with `debug`.
     pub inspection: Option<Inspection<'a>>,
-    /// `http_raw`: break the request this way before sending it.
-    pub malformation: Option<http_raw::Malformation>,
+    /// Break the request (`http_raw`) or a working-directory file (`cli`).
+    pub breakage: Option<Breakage>,
+}
+
+/// What a broken-input case breaks in the step it targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Breakage {
+    /// `use: malform`: the HTTP request.
+    Request(http_raw::Malformation),
+    /// `use: envfile`: the named case of the step's `.env`-style file.
+    EnvFile(String),
 }
 
 /// The `debug` hook for one request and the values to redact in it.

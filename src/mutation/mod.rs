@@ -49,6 +49,8 @@ pub enum InputKind {
     JsonField,
     HeaderField,
     PathField,
+    /// A `protocol: cli` step's environment variable.
+    EnvVar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -129,6 +131,9 @@ enum VariantId {
     Header(usize),
     /// `use: http`, `mode: absent`: the header is left out.
     Absent,
+    /// `path`: a line (1-based) of the file, with the file's fingerprint
+    /// (`ValueLines::fingerprint`): a changed file no longer resolves.
+    Line { line: usize, file: u64 },
 }
 
 const EDGE_CASES_V1: [VariantId; 5] = [
@@ -182,6 +187,29 @@ impl VariantId {
     }
 }
 
+/// The `edge_cases` or `unconstrained` catalog for an environment variable,
+/// as (stable name, value) in catalog order: every entry but `nul_byte`,
+/// which an environment value cannot carry.
+pub(crate) fn envar_catalog(unconstrained: bool) -> Vec<(String, String)> {
+    let catalog: &[VariantId] = if unconstrained { &UNCONSTRAINED } else { &EDGE_CASES };
+    let mut entries: Vec<(String, String)> = catalog
+        .iter()
+        .filter(|id| **id != VariantId::NulByte)
+        .filter_map(|id| {
+            let Some(ReplacementValue::JsonString(text)) = id.json_value() else {
+                return None;
+            };
+            let name = serde_json::to_value(id).ok()?.get("kind")?.as_str()?.to_owned();
+            Some((name, text))
+        })
+        .collect();
+    // An environment value can carry bytes JSON and headers cannot.
+    if unconstrained {
+        entries.push(("non_unicode".into(), crate::adapters::cli::osvalue::non_unicode()));
+    }
+    entries
+}
+
 /// Longest string `mode: schema` generates for `maxLength` cases.
 const MAX_GENERATED_LENGTH: u64 = 1 << 20;
 /// Largest `maxItems` for which `mode: schema` builds an oversized array.
@@ -216,7 +244,7 @@ fn http_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, Re
         }
     };
     for (index, mutator) in step.mutators.iter().enumerate() {
-        let MutatorDecl::Http { fields, mode, values, field_schemas } = mutator else {
+        let MutatorDecl::Http { fields, mode, values, field_schemas, lines } = mutator else {
             continue;
         };
         if !descriptor.uses_mutator(index) {
@@ -235,19 +263,39 @@ fn http_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, Re
                 .map(schema_variants)
                 .unwrap_or_default(),
             JsonMutatorMode::Absent => vec![(VariantId::Absent, ReplacementValue::Absent)],
-            JsonMutatorMode::Values | JsonMutatorMode::Alphanumeric | JsonMutatorMode::Text(_) => Vec::new(),
+            JsonMutatorMode::Values
+            | JsonMutatorMode::Lines
+            | JsonMutatorMode::Alphanumeric
+            | JsonMutatorMode::Text(_)
+            | JsonMutatorMode::Env(_) => Vec::new(),
         };
         let custom = values
             .iter()
             .enumerate()
             .map(|(index, value)| (VariantId::Custom(index), ReplacementValue::JsonString(value.clone())));
+        // Header lines a header cannot carry are left out by `as_text`.
         return catalog
             .into_iter()
+            .chain(line_variants(lines.as_ref()))
             .chain(custom)
             .filter_map(|(id, value)| Some((id, as_text(value)?)))
             .collect();
     }
     Vec::new()
+}
+
+/// One variant per line of a `path` file, in file order.
+fn line_variants(lines: Option<&crate::experiment::types::ValueLines>) -> Vec<(VariantId, ReplacementValue)> {
+    let Some(lines) = lines else {
+        return Vec::new();
+    };
+    let file = lines.fingerprint();
+    lines
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| (VariantId::Line { line: index + 1, file }, ReplacementValue::JsonString(line.clone())))
+        .collect()
 }
 
 fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, ReplacementValue)> {
@@ -260,6 +308,7 @@ fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, Re
             mode,
             values,
             field_schemas,
+            lines,
         } = mutator
         else {
             continue;
@@ -286,8 +335,11 @@ fn json_variants(step: &Step, descriptor: &PartDescriptor) -> Vec<(VariantId, Re
             JsonMutatorMode::Alphanumeric
             | JsonMutatorMode::Text(_)
             | JsonMutatorMode::Absent
-            | JsonMutatorMode::Values => Vec::new(),
+            | JsonMutatorMode::Values
+            | JsonMutatorMode::Lines
+            | JsonMutatorMode::Env(_) => Vec::new(),
         };
+        variants.extend(line_variants(lines.as_ref()));
         variants.extend(values.iter().enumerate().map(|(index, value)| {
             let value = match value {
                 Value::String(text) => ReplacementValue::JsonString(text.clone()),
@@ -430,6 +482,14 @@ fn offset(bound: &Value, delta: i64) -> Option<Value> {
 }
 
 impl RegressionVariant {
+    /// The line of a `path` file this variant was saved from, if any.
+    pub(crate) fn saved_line(&self) -> Option<usize> {
+        match self.identity {
+            VariantIdentity::Stable { variant_id: VariantId::Line { line, .. } } => Some(line),
+            _ => None,
+        }
+    }
+
     pub(crate) fn from_replacement(
         experiment: &Experiment,
         descriptor: &PartDescriptor,
@@ -607,7 +667,26 @@ pub(crate) fn build_descriptors(experiment: &Experiment) -> Vec<PartDescriptor> 
         for (mutator_index, mutator) in step.mutators.iter().enumerate() {
             match mutator {
                 // Malformations are enumerated cases, not parts to mutate.
-                MutatorDecl::Malform { .. } => {}
+                MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } => {}
+                // Variables with `mode` are random parts; fixed `value`/`values`
+                // are enumerated cases.
+                MutatorDecl::Envar { variables, .. } => {
+                    for variable in variables {
+                        let mode = match variable.rule {
+                            crate::experiment::types::EnvarVariableRule::Mode(mode) => JsonMutatorMode::Env(mode),
+                            crate::experiment::types::EnvarVariableRule::Text(generator) => JsonMutatorMode::Text(generator),
+                            _ => continue,
+                        };
+                        descriptors.push(PartDescriptor {
+                            step_id: step.id.clone(),
+                            canonical_selector: variable.name.clone(),
+                            input_kind: InputKind::EnvVar,
+                            representation: ValueRepresentation::JsonString,
+                            mutation_mode: Some(mode),
+                            mutator_index: Some(mutator_index),
+                        });
+                    }
+                }
                 MutatorDecl::Json { fields, mode, .. } => {
                     let field_list = fields.clone().unwrap_or_default();
                     for field in &field_list {
@@ -696,7 +775,8 @@ pub fn build_token_dictionary(experiment: &Experiment) -> Vec<Vec<u8>> {
     for step in &experiment.steps {
         for mutator in &step.mutators {
             match mutator {
-                MutatorDecl::Malform { .. } => {}
+                MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } => {}
+                MutatorDecl::Envar { .. } => {}
                 MutatorDecl::Http { values, .. } => {
                     for v in values {
                         let bytes = v.as_bytes().to_vec();
@@ -739,6 +819,20 @@ pub fn build_token_dictionary(experiment: &Experiment) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envar_catalogs_are_the_shared_ones_without_nul() {
+        let names = |unconstrained| envar_catalog(unconstrained).into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+        assert_eq!(names(false), ["empty", "long_lowercase", "long_uppercase", "unicode", "reserved"]);
+        assert_eq!(
+            names(true),
+            ["empty", "long_lowercase", "huge_uppercase", "script_tag", "sql_quote", "template_syntax", "null_string", "non_unicode"]
+        );
+        // No value reaches the process with a NUL (`non_unicode` is encoded).
+        use std::os::unix::ffi::OsStrExt;
+        assert!(envar_catalog(true).iter().all(|(_, value)| !crate::adapters::cli::osvalue::decode(value).as_bytes().contains(&0)));
+        assert_eq!(envar_catalog(true)[2].1.len(), 65536);
+    }
     use crate::adapters::http::contract;
     use crate::config;
     use crate::experiment;
@@ -1135,6 +1229,7 @@ experiment:
             fields: Some(vec!["metadata.source".into()]),
             mode: JsonMutatorMode::Schema,
             values: vec![Value::from("custom"), serde_json::json!({"k": 1})],
+            lines: None,
             field_schemas: [(
                 "metadata.source".to_string(),
                 field(serde_json::json!({"type": "string", "minLength": 1}), true),

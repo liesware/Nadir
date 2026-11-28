@@ -122,6 +122,12 @@ pub(crate) fn regression_record<'a>(
                                             .join(" or "),
                                         ExpectCondition::Exists => "present".into(),
                                         ExpectCondition::Rejected => "rejection (status >= 400)".into(),
+                                        ExpectCondition::Refused => {
+                                            "an exit before ready with a non-zero code, naming the variable, without echoing the value".into()
+                                        }
+                                        ExpectCondition::StartsWithDefault => {
+                                            "a start with the documented default (ready, or exit 0 without service)".into()
+                                        }
                                         ExpectCondition::Handled => {
                                             "an answer without a 5xx, or a closed connection, before the timeout".into()
                                         }
@@ -199,6 +205,8 @@ pub(crate) fn regression_record<'a>(
         artifact_version: match evaluated.plan {
             crate::evaluation::case::ExecutedPlan::Corpus(_) => CaseRecord::CORPUS_VERSION,
             crate::evaluation::case::ExecutedPlan::Malform { .. } => CaseRecord::MALFORM_VERSION,
+            crate::evaluation::case::ExecutedPlan::EnvFile { .. } => CaseRecord::ENVFILE_VERSION,
+            crate::evaluation::case::ExecutedPlan::Envar { .. } => CaseRecord::ENVAR_VERSION,
             crate::evaluation::case::ExecutedPlan::Example { json_example: Some(_), .. } =>
                 CaseRecord::JSON_EXAMPLE_VERSION,
             _ => CaseRecord::CURRENT_VERSION,

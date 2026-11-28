@@ -38,10 +38,22 @@ pub(crate) fn request_template(
     for mutator in &step.mutators {
         match mutator {
             // The template shows the well-formed request; notes list the catalog.
-            MutatorDecl::Malform { .. } => {}
+            MutatorDecl::Malform { .. } | MutatorDecl::EnvFile { .. } => {}
+            MutatorDecl::Envar { .. } => {}
             MutatorDecl::Json { fields, mode, .. } => {
                 for field in fields.iter().flatten() {
-                    replacements.push((format!("body.{field}"), ReplacementValue::JsonString(marker(mode_name(mode)))));
+                    let selector = format!("body.{field}");
+                    // Several mutators on one field show as `{{raw|file|num}}`.
+                    let shown = match replacements.iter().position(|(existing, _)| *existing == selector) {
+                        Some(index) => match replacements.remove(index).1 {
+                            ReplacementValue::JsonString(previous) => {
+                                format!("{}|{}}}}}", previous.trim_end_matches('}'), mode_name(mode))
+                            }
+                            _ => marker(mode_name(mode)),
+                        },
+                        None => marker(mode_name(mode)),
+                    };
+                    replacements.push((selector, ReplacementValue::JsonString(shown)));
                 }
             }
             MutatorDecl::Http { fields, mode, .. } => {
@@ -143,6 +155,7 @@ fn notes(step: &Step) -> Vec<String> {
     let mut notes = Vec::new();
     for mutator in &step.mutators {
         match mutator {
+            MutatorDecl::EnvFile { .. } => {}
             MutatorDecl::Malform { malformations } => {
                 let all = crate::adapters::http_raw::Malformation::ALL.len();
                 notes.push(if malformations.len() == all {
@@ -152,7 +165,11 @@ fn notes(step: &Step) -> Vec<String> {
                     format!("malform: catalog, {} cases: {}", names.len(), names.join(", "))
                 });
             }
-            MutatorDecl::Json { fields, mode, values, .. } => {
+            MutatorDecl::Envar { variables, .. } => {
+                let names: Vec<&str> = variables.iter().map(|v| v.name.as_str()).collect();
+                notes.push(format!("envar: {}", names.join(", ")));
+            }
+            MutatorDecl::Json { fields, mode, values, lines, .. } => {
                 let fields = fields.as_deref().unwrap_or_default();
                 if fields.is_empty() {
                     continue;
@@ -166,12 +183,15 @@ fn notes(step: &Step) -> Vec<String> {
                         generator.max,
                     ));
                 }
+                if let Some(lines) = lines {
+                    note.push_str(&format!(", {} lines from {}", lines.lines.len(), lines.path));
+                }
                 if !values.is_empty() {
                     note.push_str(&format!(", plus {} custom values", values.len()));
                 }
                 notes.push(note);
             }
-            MutatorDecl::Http { fields, mode, values, .. } => {
+            MutatorDecl::Http { fields, mode, values, lines, .. } => {
                 let fields: Vec<String> = fields.iter().map(|field| field.selector()).collect();
                 let mut note = format!("{}: {}", fields.join(", "), mode_name(mode));
                 if let JsonMutatorMode::Text(generator) = mode {
@@ -181,6 +201,10 @@ fn notes(step: &Step) -> Vec<String> {
                         generator.above + 1,
                         generator.max,
                     ));
+                }
+                if let Some(lines) = lines {
+                    // Headers leave out lines with control characters.
+                    note.push_str(&format!(", {} lines from {}", lines.lines.len(), lines.path));
                 }
                 if !values.is_empty() {
                     let label = if *mode == JsonMutatorMode::Values { "" } else { "plus " };
@@ -235,6 +259,11 @@ fn mode_name(mode: &JsonMutatorMode) -> &'static str {
         JsonMutatorMode::Text(generator) => generator.alphabet.name(),
         JsonMutatorMode::Absent => "absent",
         JsonMutatorMode::Values => "values",
+        JsonMutatorMode::Lines => "file",
+        JsonMutatorMode::Env(crate::experiment::types::EnvarMode::Alpha) => "alpha",
+        JsonMutatorMode::Env(crate::experiment::types::EnvarMode::Alphanum) => "alphanum",
+        JsonMutatorMode::Env(crate::experiment::types::EnvarMode::Num) => "num",
+        JsonMutatorMode::Env(crate::experiment::types::EnvarMode::Raw) => "raw",
     }
 }
 

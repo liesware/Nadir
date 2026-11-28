@@ -27,6 +27,9 @@ pub enum InputSelector {
     PathParam(String),
     /// `header.Accept`
     HeaderParam(String),
+    /// A `protocol: cli` step's environment variable whose `env` value holds
+    /// `${…}` references, resolved like any binding before each run.
+    EnvVar(String),
 }
 
 /// Identifies a location in a step's observation.
@@ -39,6 +42,18 @@ pub enum ObservationSelector {
     /// `response.body.items[0].id` → `Body([Key("items"), Index(0), Key("id")])`
     Body(Vec<JsonPathSegment>),
     Step { step_id: String, selector: Box<ObservationSelector> },
+    /// `process.exit_code` → process exit code (CLI steps).
+    ProcessExitCode,
+    /// `process.stdout` → process stdout (CLI steps).
+    ProcessStdout,
+    /// `process.stderr` → process stderr (CLI steps).
+    ProcessStderr,
+    /// `process.timed_out` → whether the process timed out (CLI steps).
+    ProcessTimedOut,
+    /// `process.ready` → whether a `service` reached its ready URL.
+    ProcessReady,
+    /// `process.stopped_code` → the exit code after Nadir stopped a ready service.
+    ProcessStoppedCode,
 }
 
 /// A single segment in a JSON observation path.
@@ -153,6 +168,10 @@ pub fn parse_input_selector(raw: &str) -> Result<InputSelector, String> {
 /// - `status`        → `ObservationSelector::Status`
 /// - `header.<name>` → `ObservationSelector::Header`
 /// - `body.<path>`   → `ObservationSelector::Body`
+/// - `process.exit_code` → `ObservationSelector::ProcessExitCode`
+/// - `process.stdout`    → `ObservationSelector::ProcessStdout`
+/// - `process.stderr`    → `ObservationSelector::ProcessStderr`
+/// - `process.timed_out` → `ObservationSelector::ProcessTimedOut`
 pub fn parse_observation_selector(raw: &str) -> Result<ObservationSelector, String> {
     if raw == "status" {
         Ok(ObservationSelector::Status)
@@ -167,6 +186,18 @@ pub fn parse_observation_selector(raw: &str) -> Result<ObservationSelector, Stri
         }
         let path = parse_json_path(rest)?;
         Ok(ObservationSelector::Body(path))
+    } else if raw == "process.exit_code" {
+        Ok(ObservationSelector::ProcessExitCode)
+    } else if raw == "process.stdout" {
+        Ok(ObservationSelector::ProcessStdout)
+    } else if raw == "process.stderr" {
+        Ok(ObservationSelector::ProcessStderr)
+    } else if raw == "process.timed_out" {
+        Ok(ObservationSelector::ProcessTimedOut)
+    } else if raw == "process.ready" {
+        Ok(ObservationSelector::ProcessReady)
+    } else if raw == "process.stopped_code" {
+        Ok(ObservationSelector::ProcessStoppedCode)
     } else {
         Err(format!("unknown observation selector: '{}'", raw))
     }
@@ -429,6 +460,7 @@ impl fmt::Display for InputSelector {
             Self::BodyField(path) => write!(f, "body.{}", path.join(".")),
             Self::PathParam(name) => write!(f, "path.{}", name),
             Self::HeaderParam(name) => write!(f, "header.{}", name),
+            Self::EnvVar(name) => write!(f, "env.{}", name),
         }
     }
 }
@@ -449,6 +481,12 @@ impl fmt::Display for ObservationSelector {
                 Ok(())
             }
             Self::Step { step_id, selector } => write!(f, "steps.{step_id}.{selector}"),
+            Self::ProcessExitCode => write!(f, "process.exit_code"),
+            Self::ProcessStdout => write!(f, "process.stdout"),
+            Self::ProcessStderr => write!(f, "process.stderr"),
+            Self::ProcessTimedOut => write!(f, "process.timed_out"),
+            Self::ProcessReady => write!(f, "process.ready"),
+            Self::ProcessStoppedCode => write!(f, "process.stopped_code"),
         }
     }
 }

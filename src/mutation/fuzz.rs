@@ -315,6 +315,9 @@ fn random_value(
     if descriptor.mutation_mode == Some(JsonMutatorMode::Absent) {
         return ReplacementValue::Absent;
     }
+    if let Some(JsonMutatorMode::Env(mode)) = descriptor.mutation_mode {
+        return ReplacementValue::JsonString(envar_value(rng, mode));
+    }
     if let Some(JsonMutatorMode::Text(generator)) = descriptor.mutation_mode {
         return text_value(generator.generate(rng, ""));
     }
@@ -379,6 +382,26 @@ fn random_value(
     } else {
         text_value(text)
     }
+}
+
+/// A random environment value of 1 to 64 characters from the mode's alphabet
+/// (`raw`: any character but NUL).
+fn envar_value(rng: &mut Rng, mode: crate::experiment::types::EnvarMode) -> String {
+    use crate::experiment::types::EnvarMode;
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const ALPHANUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const DIGITS: &[u8] = b"0123456789";
+    let alphabet = match mode {
+        EnvarMode::Alpha => ALPHA,
+        EnvarMode::Alphanum => ALPHANUM,
+        EnvarMode::Num => DIGITS,
+        EnvarMode::Raw => {
+            let length = 1 + rng.below(64);
+            return (0..length).map(|_| crate::mutation::text::Alphabet::EnvRaw.pick(rng)).collect();
+        }
+    };
+    let length = 1 + rng.below(64);
+    (0..length).map(|_| char::from(alphabet[rng.below(alphabet.len())])).collect()
 }
 
 /// Apply one to four random edits to `text`.
@@ -664,7 +687,8 @@ experiment:
                         crate::experiment::types::MutatorDecl::Http { fields, .. } => fields
                             .iter()
                             .any(|field| selector == &field.selector()),
-                        crate::experiment::types::MutatorDecl::Malform { .. } => false,
+                        crate::experiment::types::MutatorDecl::Envar { .. } => false,
+                        crate::experiment::types::MutatorDecl::Malform { .. } | crate::experiment::types::MutatorDecl::EnvFile { .. } => false,
                     }),
                     "{selector} is not mutable in {}",
                     case.step_id

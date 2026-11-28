@@ -102,6 +102,8 @@ fn default_map_size() -> usize {
 pub struct RawProtocols {
     #[serde(default)]
     pub http: Option<RawHttpProtocol>,
+    #[serde(default)]
+    pub cli: Option<RawCliProtocol>,
 }
 
 /// HTTP protocol configuration.
@@ -114,8 +116,20 @@ pub struct RawHttpProtocol {
     pub timeout_ms: u64,
 }
 
+/// CLI protocol configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCliProtocol {
+    #[serde(default = "default_cli_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
 fn default_http_timeout_ms() -> u64 {
     2000
+}
+
+fn default_cli_timeout_ms() -> u64 {
+    5000
 }
 
 /// A single workflow step.
@@ -145,6 +159,57 @@ pub struct RawStep {
     /// Show each request of this step before sending it.
     #[serde(default)]
     pub debug: Option<RawDebug>,
+    /// CLI steps: the command and its arguments.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// CLI steps: base environment variables.
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    /// CLI steps: a `.env` file with the base environment (relative to the
+    /// experiment file). `env` entries override it.
+    #[serde(default)]
+    pub env_file: Option<String>,
+    /// CLI steps: run each case in a fresh temporary directory with copies
+    /// of these files.
+    #[serde(default)]
+    pub workdir: Option<RawWorkdir>,
+    /// CLI steps: the command is a service; wait until it is ready, then stop it.
+    #[serde(default)]
+    pub service: Option<RawService>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawWorkdir {
+    #[serde(default)]
+    pub copy: Vec<RawCopy>,
+}
+
+/// One `workdir.copy` entry: a path kept as is, or `{from, to}` to copy a
+/// file under another name (for example a prepared file as `.env`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawCopy {
+    Same(String),
+    Renamed { from: String, to: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawService {
+    pub ready: RawServiceReady,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawServiceReady {
+    pub url: String,
+    #[serde(default = "default_service_ready_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_service_ready_ms() -> u64 {
+    3000
 }
 
 /// `debug: true` waits for a key; `debug: {auto: N}` advances every N seconds.
@@ -244,6 +309,128 @@ pub struct RawMutator {
     /// `use: malform`: the catalog entries to run (default: all).
     #[serde(default)]
     pub only: Option<Vec<String>>,
+    /// `use: envar`: variables to vary. Accepts a list of names (all share
+    /// the same `mode`) or a map from name to `{value, values}`.
+    #[serde(default, deserialize_with = "deserialize_envar_variables")]
+    pub variables: Option<EnvarVariables>,
+    /// `use: envar`, `mode: spec`: the specification file (relative to the
+    /// experiment file).
+    #[serde(default)]
+    pub spec: Option<String>,
+    /// `use: envfile`: the file to break, as `workdir.copy` names it in the
+    /// working directory (for example `.env`).
+    #[serde(default)]
+    pub file: Option<String>,
+    /// `use: envfile`: documented size limits; each adds its case.
+    #[serde(default)]
+    pub limits: Option<RawEnvLimits>,
+    /// `use: envfile`: variables the file must not set (one case each).
+    #[serde(default)]
+    pub prohibited: Option<Vec<String>>,
+}
+
+/// `use: envfile` `limits`, in bytes.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawEnvLimits {
+    pub file_bytes: Option<usize>,
+    pub value_bytes: Option<usize>,
+    pub name_bytes: Option<usize>,
+}
+
+/// The `variables` field of an `envar` mutator, supporting two YAML shapes.
+#[derive(Debug, Clone)]
+pub enum EnvarVariables {
+    /// List form: `variables: [APP_LABEL, APP_PROFILE]`
+    List(Vec<String>),
+    /// Map form: `variables: { APP_OUTPUT_FORMAT: {values: ["json","text"]} }`
+    Map(HashMap<String, EnvarRule>),
+    /// `variables: all`: every variable of the base environment that no
+    /// other `envar` mutator of the step varies.
+    All,
+    /// `variables: spec`: every variable of the `spec` file (that its
+    /// `used_when` allows) that no other `envar` mutator of the step varies.
+    Spec,
+}
+
+/// A single variable rule in the map form.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvarRule {
+    #[serde(default, deserialize_with = "present_value")]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub values: Option<Vec<serde_json::Value>>,
+    /// A file with one value per line (relative to the experiment file).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for EnvarVariables {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct EnvarVariablesVisitor;
+
+        impl<'de> de::Visitor<'de> for EnvarVariablesVisitor {
+            type Value = EnvarVariables;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of variable names, a map from name to rule, 'all' or 'spec'")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "all" => Ok(EnvarVariables::All),
+                    "spec" => Ok(EnvarVariables::Spec),
+                    other => Err(E::custom(format!("variables: '{other}' (expected a list, a map, 'all' or 'spec')"))),
+                }
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut names = Vec::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    names.push(name);
+                }
+                if names.is_empty() {
+                    return Err(de::Error::invalid_length(0, &"at least one variable"));
+                }
+                Ok(EnvarVariables::List(names))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut rules = HashMap::new();
+                while let Some((name, rule)) = map.next_entry::<String, EnvarRule>()? {
+                    rules.insert(name, rule);
+                }
+                if rules.is_empty() {
+                    return Err(de::Error::invalid_length(0, &"at least one variable"));
+                }
+                Ok(EnvarVariables::Map(rules))
+            }
+        }
+
+        deserializer.deserialize_any(EnvarVariablesVisitor)
+    }
+}
+
+fn deserialize_envar_variables<'de, D>(deserializer: D) -> Result<Option<EnvarVariables>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<EnvarVariables>::deserialize(deserializer)
 }
 
 #[derive(Debug, Deserialize)]

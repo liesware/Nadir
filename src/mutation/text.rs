@@ -23,11 +23,17 @@ pub(crate) enum Alphabet {
     /// `Raw` without the characters a header value cannot carry: printable
     /// ASCII, tab, and the same non-ASCII set (sent as UTF-8 bytes).
     HeaderRaw,
+    /// ASCII digits (`envar` `mode: num`).
+    Num,
+    /// `Raw` without NUL, the one character an environment value cannot
+    /// carry (`envar` `mode: raw`).
+    EnvRaw,
 }
 
 // Order matters: replay regenerates values from the seed and these tables.
 const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const ALPHANUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const DIGITS: &[u8] = b"0123456789";
 
 /// Non-ASCII characters that commonly break validation, normalization,
 /// storage or rendering.
@@ -72,7 +78,8 @@ impl Alphabet {
         match self {
             Self::Alpha => "alpha",
             Self::Alphanum => "alphanum",
-            Self::Raw | Self::HeaderRaw => "raw",
+            Self::Num => "num",
+            Self::Raw | Self::HeaderRaw | Self::EnvRaw => "raw",
         }
     }
 
@@ -96,6 +103,16 @@ impl Alphabet {
                 6 => '\t',
                 _ => RAW_UNICODE[rng.below(RAW_UNICODE.len())],
             },
+            Self::Num => char::from(DIGITS[rng.below(DIGITS.len())]),
+            // As `Raw`, with controls 0x01-0x1F and DEL (never NUL).
+            Self::EnvRaw => match rng.below(10) {
+                0..=4 => char::from(0x20 + rng.below(0x5F) as u8),
+                5 | 6 => match rng.below(32) {
+                    31 => '\u{7F}',
+                    control => char::from(control as u8 + 1),
+                },
+                _ => RAW_UNICODE[rng.below(RAW_UNICODE.len())],
+            },
         }
     }
 
@@ -105,6 +122,8 @@ impl Alphabet {
             Self::Alphanum => character.is_ascii_alphanumeric(),
             Self::Raw => true,
             Self::HeaderRaw => header_safe(character),
+            Self::Num => character.is_ascii_digit(),
+            Self::EnvRaw => character != '\0',
         }
     }
 }
@@ -242,6 +261,35 @@ impl Corpus {
     }
 }
 
+/// The lines of a value file (`path`) and its SHA-256: UTF-8, up to 1 MiB,
+/// at least one line, each up to 4096 characters. Blank lines are kept as
+/// empty values; `\r\n` endings are accepted. `allow_nul: false` (an
+/// environment value) rejects lines with NUL.
+pub(crate) fn load_value_lines(path: &Path, allow_nul: bool) -> io::Result<(Vec<String>, String)> {
+    if !path.metadata()?.is_file() {
+        return Err(invalid("value file must be a regular file"));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?.take((MAX_CORPUS_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CORPUS_BYTES {
+        return Err(invalid("value file exceeds 1 MiB"));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid("value file must be UTF-8"))?;
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if lines.is_empty() {
+        return Err(invalid("value file has no lines"));
+    }
+    for (index, line) in lines.iter().enumerate() {
+        if line.chars().count() > MAX_TEXT_CHARS {
+            return Err(invalid(format!("line {} exceeds {MAX_TEXT_CHARS} characters", index + 1)));
+        }
+        if !allow_nul && line.contains('\0') {
+            return Err(invalid(format!("line {} contains NUL, which an environment value cannot carry", index + 1)));
+        }
+    }
+    Ok((lines, format!("{:x}", Sha256::digest(&bytes))))
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -249,6 +297,35 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_alphabets_never_produce_nul() {
+        let mut rng = Rng::for_case(7, 0);
+        let raw: String = (0..20_000).map(|_| Alphabet::EnvRaw.pick(&mut rng)).collect();
+        assert!(!raw.contains('\0'));
+        assert!(raw.chars().any(|character| character.is_control()), "controls are still probed");
+        assert!(raw.contains('\u{7F}') && raw.contains('\u{1}') && raw.contains('\u{1F}'));
+        let digits: String = (0..200).map(|_| Alphabet::Num.pick(&mut rng)).collect();
+        assert!(digits.chars().all(|character| character.is_ascii_digit()));
+        assert_eq!((Alphabet::Num.name(), Alphabet::EnvRaw.name()), ("num", "raw"));
+    }
+
+    #[test]
+    fn value_files_keep_blank_lines_and_reject_nul() {
+        let dir = std::env::temp_dir().join(format!("nadir-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("values.txt");
+        std::fs::write(&file, "../etc\r\n\n; rm -rf /\n").unwrap();
+        let (lines, sha) = load_value_lines(&file, false).unwrap();
+        assert_eq!(lines, ["../etc", "", "; rm -rf /"]);
+        assert_eq!(sha.len(), 64);
+        std::fs::write(&file, "ok\nbad\0value\n").unwrap();
+        assert!(load_value_lines(&file, false).unwrap_err().to_string().contains("line 2 contains NUL"));
+        assert_eq!(load_value_lines(&file, true).unwrap().0, ["ok", "bad\0value"]);
+        std::fs::write(&file, "").unwrap();
+        assert!(load_value_lines(&file, false).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn seeded_text_has_equal_length_sides_and_the_selected_alphabet() {

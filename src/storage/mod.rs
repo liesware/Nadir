@@ -268,6 +268,8 @@ pub(crate) fn case_record(
         corpus: None,
         json_example: None,
         malform: None,
+        envar: None,
+        envfile: None,
     };
     match &evaluated.plan {
         ExecutedPlan::Baseline => {}
@@ -286,6 +288,16 @@ pub(crate) fn case_record(
             });
         }
         ExecutedPlan::Corpus(reference) => plan.corpus = Some(reference.clone()),
+        ExecutedPlan::Envar { step_id, variable, case, .. } => {
+            plan.envar = Some(crate::artifacts::EnvarRef {
+                step_id: step_id.clone(),
+                variable: variable.clone(),
+                case: case.clone(),
+            });
+        }
+        ExecutedPlan::EnvFile { step_id, name } => {
+            plan.envfile = Some(crate::artifacts::EnvFileRef { step_id: step_id.clone(), name: name.clone() });
+        }
         ExecutedPlan::Malform { step_id, malformation } => {
             plan.malform = Some(crate::artifacts::MalformRef {
                 step_id: step_id.clone(),

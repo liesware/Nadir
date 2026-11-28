@@ -147,6 +147,8 @@ pub(crate) fn run_with_progress(
         .map(|corpus| usize::from(corpus.repetitions))
         .fold(0usize, usize::saturating_add);
     let malform_cases = malform_cases(experiment);
+    let envfile_cases = envfile_cases(experiment);
+    let envar_enumerated_count = envar_enumerated_cases(experiment).len();
     if let ExplorationStrategy::Fuzz { max_execs, .. } = experiment.exploration.strategy {
         if !build_descriptors(experiment).is_empty()
             || experiment.steps.iter().any(|step| !step.key_mutators.is_empty())
@@ -158,6 +160,8 @@ pub(crate) fn run_with_progress(
         1 + (plans.len() + example_count)
             .saturating_add(corpus_count)
             .saturating_add(malform_cases.len())
+            .saturating_add(envfile_cases.len())
+            .saturating_add(envar_enumerated_count)
             .min(available_slots) as u64
             + u64::from(progress.random_limit.unwrap_or(0)),
     );
@@ -272,6 +276,35 @@ pub(crate) fn run_with_progress(
         }
     }
 
+    // `envfile`: one case per way to break each cli step's file.
+    if phase_completed {
+        for (step_id, name) in &envfile_cases {
+            let (sid, sid2) = (step_id.clone(), step_id.clone());
+            let (case, case2) = (name.clone(), name.clone());
+            let (should_break, reason) = try_next_case(
+                runner,
+                budget,
+                move |r| r.execute_envfile(&sid, &case),
+                move |execution, schema_cache| EvaluatedCase::new(
+                    experiment,
+                    execution,
+                    ExecutedPlan::EnvFile { step_id: sid2.clone(), name: case2.clone() },
+                    schema_cache,
+                ),
+                &mut findings,
+                &mut cases,
+                &mut progress,
+                &mut *on_progress,
+                &mut *on_case_evidence,
+            )?;
+            if should_break {
+                stop_reason = reason;
+                phase_completed = false;
+                break;
+            }
+        }
+    }
+
     // `malform`: one case per malformation of each `http_raw` step.
     if phase_completed {
         for (step_id, malformation) in &malform_cases {
@@ -286,6 +319,43 @@ pub(crate) fn run_with_progress(
                     experiment,
                     execution,
                     ExecutedPlan::Malform { step_id: sid2, malformation: mal },
+                    schema_cache,
+                ),
+                &mut findings,
+                &mut cases,
+                &mut progress,
+                &mut *on_progress,
+                &mut *on_case_evidence,
+            )?;
+            if should_break {
+                stop_reason = reason;
+                phase_completed = false;
+                break;
+            }
+        }
+    }
+
+    // envar: one case per fixed value of each variable with `value`/`values`.
+    if phase_completed {
+        let envar_cases = envar_enumerated_cases(experiment);
+        for (step_id, var_name, case, value) in &envar_cases {
+            let sid = step_id.clone();
+            let vname = var_name.clone();
+            let val = value.clone();
+            let case = case.clone();
+            let (should_break, reason) = try_next_case(
+                runner,
+                budget,
+                |r| r.execute_variant(&sid, &vname, crate::experiment::types::envar_replacement(&val)),
+                |execution, schema_cache| EvaluatedCase::new(
+                    experiment,
+                    execution,
+                    crate::evaluation::case::ExecutedPlan::Envar {
+                        step_id: sid.clone(),
+                        variable: vname.clone(),
+                        case: case.clone(),
+                        value: val.clone(),
+                    },
                     schema_cache,
                 ),
                 &mut findings,
@@ -396,6 +466,72 @@ where
         return Ok((true, RunStopReason::ProcessExit));
     }
     Ok((false, RunStopReason::EnumerationComplete))
+}
+
+/// Every enumerated `envar` case, `(step, variable, case, value)`: each
+/// `value`/`values` entry, then each invalid value of each `mode: spec` rule.
+pub(crate) fn envar_enumerated_cases(
+    experiment: &Experiment,
+) -> Vec<(String, String, crate::artifacts::EnvarCase, Option<String>)> {
+    use crate::artifacts::EnvarCase;
+    use crate::experiment::types::{EnvarVariableRule, MutatorDecl};
+    let mut cases = Vec::new();
+    for step in &experiment.steps {
+        for mutator in &step.mutators {
+            let MutatorDecl::Envar { variables, .. } = mutator else {
+                continue;
+            };
+            for var in variables {
+                let mut push = |case, value: Option<String>| cases.push((step.id.clone(), var.name.clone(), case, value));
+                match &var.rule {
+                    EnvarVariableRule::Fixed(value) => push(EnvarCase::Value(0), Some(value.clone())),
+                    EnvarVariableRule::Values(values) => {
+                        for (index, value) in values.iter().enumerate() {
+                            push(EnvarCase::Value(index), Some(value.clone()));
+                        }
+                    }
+                    EnvarVariableRule::Spec(rule) => {
+                        for (name, value) in crate::adapters::cli::spec::cases_for(&var.name, rule, step.env_config.as_ref()) {
+                            match value {
+                                Some(value) => push(EnvarCase::Spec(name), Some(value)),
+                                None => push(EnvarCase::Unset, None),
+                            }
+                        }
+                    }
+                    EnvarVariableRule::File { sha256, lines, .. } => {
+                        for (index, value) in lines.iter().enumerate() {
+                            push(EnvarCase::Line { line: index + 1, sha256: sha256.clone() }, Some(value.clone()));
+                        }
+                    }
+                    EnvarVariableRule::Absent => push(EnvarCase::Unset, None),
+                    EnvarVariableRule::Catalog { unconstrained } => {
+                        for (name, value) in crate::mutation::envar_catalog(*unconstrained) {
+                            push(EnvarCase::Catalog(name), Some(value));
+                        }
+                    }
+                    // Generative modes are handled by the fuzz phase.
+                    EnvarVariableRule::Mode(_) | EnvarVariableRule::Text(_) => {}
+                }
+            }
+        }
+    }
+    cases
+}
+
+/// Every `(step, case name)` the experiment's `envfile` mutators run.
+pub(crate) fn envfile_cases(experiment: &Experiment) -> Vec<(String, String)> {
+    experiment
+        .steps
+        .iter()
+        .flat_map(|step| {
+            step.mutators.iter().flat_map(move |mutator| match mutator {
+                crate::experiment::types::MutatorDecl::EnvFile { cases, .. } => {
+                    cases.iter().map(|case| (step.id.clone(), case.name.clone())).collect()
+                }
+                _ => Vec::new(),
+            })
+        })
+        .collect()
 }
 
 /// Every `(step, malformation)` the experiment's `malform` mutators run, in

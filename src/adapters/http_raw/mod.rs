@@ -86,9 +86,9 @@ impl StepProtocol for HttpRawStepProtocol {
             Err(error) => return Ok(AdapterExecution::input_error(error.to_string())),
         };
         let raw = raw_request(&request, self.client.host());
-        let bytes = match input.malformation {
-            Some(malformation) => malformation.apply(&raw),
-            None => raw.render(),
+        let bytes = match input.breakage {
+            Some(super::Breakage::Request(malformation)) => malformation.apply(&raw),
+            _ => raw.render(),
         };
         let mut inspection = input.inspection;
         if let Some(inspection) = inspection.as_mut() {

@@ -35,6 +35,8 @@ pub struct RequestView {
 pub enum ResponseView {
     Received { status: u16, body: Vec<u8> },
     Failed { error: String },
+    /// A `protocol: cli` run, already summarized.
+    Process { summary: String },
 }
 
 /// The template of one step for `print`.
@@ -109,6 +111,7 @@ pub fn render_response(response: &ResponseView, secrets: &[String], width: usize
             format!("response: {status} {body}")
         }
         ResponseView::Failed { error } => format!("response: {}", show(error, secrets)),
+        ResponseView::Process { summary } => format!("result: {}", show(summary, secrets)),
     };
     clip(&text, width)
 }

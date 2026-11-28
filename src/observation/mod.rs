@@ -1,4 +1,4 @@
-//! Select fields from a completed HTTP observation.
+//! Select fields from a completed HTTP or CLI observation.
 
 use crate::adapters::http::transport::HttpObservation;
 use crate::formats::json;
@@ -6,6 +6,8 @@ use crate::formats::json;
 #[derive(Debug)]
 pub enum StepObservation {
     Http(HttpObservation),
+    /// Result of executing a CLI command.
+    Cli(crate::adapters::cli::CliObservation),
     #[cfg(test)]
     InMemory(serde_json::Value),
 }
@@ -14,6 +16,7 @@ impl StepObservation {
     pub fn as_http(&self) -> Option<&HttpObservation> {
         match self {
             Self::Http(response) => Some(response),
+            Self::Cli(_) => None,
             #[cfg(test)]
             Self::InMemory(_) => None,
         }
@@ -30,6 +33,30 @@ impl StepObservation {
     pub(crate) fn select(&self, selector: &ObservationSelector) -> SelectedValue {
         match self {
             Self::Http(response) => select_response(selector, response),
+            Self::Cli(cli) => match selector {
+                ObservationSelector::ProcessExitCode => {
+                    SelectedValue::Present(serde_json::Value::from(cli.exit_code))
+                }
+                ObservationSelector::ProcessStdout => {
+                    SelectedValue::Present(serde_json::Value::String(cli.stdout.clone()))
+                }
+                ObservationSelector::ProcessStderr => {
+                    SelectedValue::Present(serde_json::Value::String(cli.stderr.clone()))
+                }
+                ObservationSelector::ProcessTimedOut => {
+                    SelectedValue::Present(serde_json::Value::Bool(cli.timed_out))
+                }
+                // Only `service` steps have these.
+                ObservationSelector::ProcessReady => match cli.ready {
+                    Some(ready) => SelectedValue::Present(serde_json::Value::Bool(ready)),
+                    None => SelectedValue::Missing,
+                },
+                ObservationSelector::ProcessStoppedCode => match cli.stopped_code {
+                    Some(code) => SelectedValue::Present(serde_json::Value::from(code)),
+                    None => SelectedValue::Missing,
+                },
+                _ => SelectedValue::Unavailable(ObservationError::NoResponse),
+            },
             #[cfg(test)]
             Self::InMemory(value) => match selector {
                 ObservationSelector::Body(path) => select_json_path(value, path),
@@ -87,7 +114,13 @@ pub(crate) fn select_response(
             };
             return select_json_path(&root, path);
         }
-        ObservationSelector::Step { .. } => {
+        ObservationSelector::Step { .. }
+        | ObservationSelector::ProcessExitCode
+        | ObservationSelector::ProcessStdout
+        | ObservationSelector::ProcessStderr
+        | ObservationSelector::ProcessTimedOut
+        | ObservationSelector::ProcessReady
+        | ObservationSelector::ProcessStoppedCode => {
             return SelectedValue::Unavailable(ObservationError::NoResponse)
         }
     };
@@ -202,5 +235,26 @@ mod tests {
         ]);
         let result = select_response(&selector, &obs);
         assert_eq!(result, SelectedValue::Present(serde_json::json!(42)));
+    }
+
+    #[test]
+    fn test_cli_process_exit_code_selection() {
+        let cli = crate::adapters::cli::CliObservation {
+            exit_code: 0,
+            stdout: "ok".into(),
+            stderr: String::new(),
+            timed_out: false,
+            ready: None,
+            stopped_code: None,
+        };
+        let obs = StepObservation::Cli(cli);
+        assert_eq!(
+            obs.select(&ObservationSelector::ProcessExitCode),
+            SelectedValue::Present(serde_json::Value::from(0))
+        );
+        assert_eq!(
+            obs.select(&ObservationSelector::ProcessTimedOut),
+            SelectedValue::Present(serde_json::Value::Bool(false))
+        );
     }
 }
